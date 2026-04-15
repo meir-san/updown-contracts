@@ -1,0 +1,25 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Foundry build output
+out/
+cache/
+lib/
+
+# Hardhat build output
+cache_hardhat/
+artifacts/
+typechain/
+typechain-types/
+
+# Foundry broadcast / deploy logs (contain tx hashes + addresses, commit if you want a record)
+broadcast/
+
+# OS
+.DS_Store
+Thumbs.db
