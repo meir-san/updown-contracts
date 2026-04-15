@@ -4,27 +4,24 @@ pragma solidity ^0.8.29;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IFactory} from "./interfaces/IFactory.sol";
-import {ITradePool} from "./interfaces/ITradePool.sol";
+import {IUpDownSettlement} from "./interfaces/IUpDownSettlement.sol";
 import {ChainlinkResolver} from "./ChainlinkResolver.sol";
 
 /// @title UpDownAutoCycler
 /// @notice Chainlink Automation-compatible keeper that auto-creates and auto-resolves
-///         RAIN UpDown prediction markets (e.g. BTC/USD, ETH/USD) on 5, 15, and 60-minute cycles.
-///         Implements checkUpkeep / performUpkeep for Chainlink Automation.
+///         UpDown prediction markets (e.g. BTC/USD, ETH/USD) on 5, 15, and 60-minute cycles.
+///         Markets are created inside a single `UpDownSettlement` contract (no per-market deploy).
 contract UpDownAutoCycler is Ownable {
     using SafeERC20 for IERC20;
 
     // ── Errors ──────────────────────────────────────────────────────────
     error InvalidTimeframeIndex();
-    error NothingToDo();
 
     // ── Events ──────────────────────────────────────────────────────────
-    event MarketCreated(address indexed pool, bytes32 indexed pairId, uint256 duration, int256 strikePrice);
+    event MarketCreated(uint256 indexed marketId, bytes32 indexed pairId, uint256 duration, int256 strikePrice);
     event MarketCreationFailed(bytes32 indexed pairId, uint256 indexed timeframe, bytes reason);
-    event ResolutionFailed(address indexed pool, bytes reason);
+    event ResolutionFailed(uint256 indexed marketId, bytes reason);
     event TimeframeToggled(uint256 indexed index, bool active);
-    event SeedLiquidityUpdated(uint256 amount);
     event FundsWithdrawn(address indexed token, uint256 amount);
 
     // ── Types ───────────────────────────────────────────────────────────
@@ -35,7 +32,7 @@ contract UpDownAutoCycler is Ownable {
     }
 
     struct ActiveMarket {
-        address pool;
+        uint256 marketId;
         uint256 endTime;
         bytes32 pairId;
     }
@@ -53,15 +50,13 @@ contract UpDownAutoCycler is Ownable {
 
     // ── State ───────────────────────────────────────────────────────────
     ChainlinkResolver public resolver;
-    address public factory;
-    IERC20 public baseToken;
-    uint256 public seedLiquidity;
+    IUpDownSettlement public settlement;
 
     TimeframeConfig[NUM_TIMEFRAMES] public timeframes;
     ActiveMarket[] internal _activeMarkets;
     mapping(bytes32 => bool) public supportedPairs;
 
-    /// @notice Pairs that receive new pools each cycle (owner extends via `addPair`).
+    /// @notice Pairs that receive new markets each cycle (owner extends via `addPair`).
     bytes32[] internal _cyclingPairs;
     mapping(bytes32 => bool) public isCyclingPair;
 
@@ -69,17 +64,9 @@ contract UpDownAutoCycler is Ownable {
     mapping(bytes32 => mapping(uint256 => uint256)) public pairTfLastCreated;
 
     // ── Constructor ─────────────────────────────────────────────────────
-    constructor(
-        address _owner,
-        address _resolver,
-        address _factory,
-        address _baseToken,
-        uint256 _seedLiquidity
-    ) Ownable(_owner) {
+    constructor(address _owner, address _resolver, address _settlement) Ownable(_owner) {
         resolver = ChainlinkResolver(_resolver);
-        factory = _factory;
-        baseToken = IERC20(_baseToken);
-        seedLiquidity = _seedLiquidity;
+        settlement = IUpDownSettlement(_settlement);
 
         // 5 min markets, 10 min dispute
         timeframes[0] = TimeframeConfig({duration: 300, disputeDuration: 600, active: true});
@@ -91,8 +78,6 @@ contract UpDownAutoCycler is Ownable {
         supportedPairs[BTCUSD] = true;
         isCyclingPair[BTCUSD] = true;
         _cyclingPairs.push(BTCUSD);
-
-        IERC20(_baseToken).forceApprove(_factory, type(uint256).max);
     }
 
     /// @notice Number of pairs that participate in automated market creation.
@@ -109,10 +94,10 @@ contract UpDownAutoCycler is Ownable {
     function activeMarkets(uint256 index)
         external
         view
-        returns (address pool, uint256 endTime, bytes32 pairId)
+        returns (uint256 marketId, uint256 endTime, bytes32 pairId)
     {
         ActiveMarket storage m = _activeMarkets[index];
-        return (m.pool, m.endTime, m.pairId);
+        return (m.marketId, m.endTime, m.pairId);
     }
 
     // ── Chainlink Automation ────────────────────────────────────────────
@@ -173,9 +158,9 @@ contract UpDownAutoCycler is Ownable {
 
         // Phase A: resolve expired markets
         for (uint256 i; i < resolveIndices.length; ++i) {
-            address pool = _activeMarkets[resolveIndices[i]].pool;
-            try resolver.resolve(pool) {} catch (bytes memory reason) {
-                emit ResolutionFailed(pool, reason);
+            uint256 marketId = _activeMarkets[resolveIndices[i]].marketId;
+            try resolver.resolve(marketId) {} catch (bytes memory reason) {
+                emit ResolutionFailed(marketId, reason);
             }
         }
 
@@ -207,33 +192,14 @@ contract UpDownAutoCycler is Ownable {
         int256 strike = resolver.getPrice(pairId);
 
         uint256 end = block.timestamp + tf.duration;
-        uint256[] memory liqPct = new uint256[](2);
-        liqPct[0] = 5000;
-        liqPct[1] = 5000;
 
-        IFactory.Params memory params = IFactory.Params({
-            isPublic: false,
-            resolverIsAI: false,
-            poolOwner: address(this),
-            referrer: address(0),
-            startTime: block.timestamp,
-            endTime: end,
-            numberOfOptions: 2,
-            oracleEndTime: tf.disputeDuration,
-            ipfsUri: "",
-            initialLiquidity: seedLiquidity,
-            liquidityPercentages: liqPct,
-            poolResolver: address(resolver),
-            baseToken: address(baseToken)
-        });
+        uint256 marketId = settlement.createMarket(pairId, tf.duration, strike);
 
-        address pool = IFactory(factory).createPool(params);
-
-        resolver.registerMarket(pool, pairId, strike);
-        _activeMarkets.push(ActiveMarket({pool: pool, endTime: end, pairId: pairId}));
+        resolver.registerMarket(marketId, address(settlement), pairId, strike);
+        _activeMarkets.push(ActiveMarket({marketId: marketId, endTime: end, pairId: pairId}));
         pairTfLastCreated[pairId][tfIdx] = block.timestamp;
 
-        emit MarketCreated(pool, pairId, tf.duration, strike);
+        emit MarketCreated(marketId, pairId, tf.duration, strike);
     }
 
     // ── Owner: configuration ────────────────────────────────────────────
@@ -242,11 +208,6 @@ contract UpDownAutoCycler is Ownable {
         if (index >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
         timeframes[index].active = active;
         emit TimeframeToggled(index, active);
-    }
-
-    function setSeedLiquidity(uint256 amount) external onlyOwner {
-        seedLiquidity = amount;
-        emit SeedLiquidityUpdated(amount);
     }
 
     /// @notice Whitelist a pair and include it in automated cycling (idempotent for cycling list).
@@ -262,17 +223,11 @@ contract UpDownAutoCycler is Ownable {
         resolver = ChainlinkResolver(_resolver);
     }
 
-    function setFactory(address _factory) external onlyOwner {
-        factory = _factory;
-        baseToken.forceApprove(_factory, type(uint256).max);
+    function setSettlement(address _settlement) external onlyOwner {
+        settlement = IUpDownSettlement(_settlement);
     }
 
     // ── Owner: fund management ──────────────────────────────────────────
-
-    /// @notice Claim seed liquidity back from a resolved pool.
-    function claimFromPool(address pool) external onlyOwner {
-        ITradePool(pool).claim();
-    }
 
     /// @notice Withdraw any ERC-20 from this contract.
     function withdrawFunds(address token, uint256 amount) external onlyOwner {
@@ -290,8 +245,8 @@ contract UpDownAutoCycler is Ownable {
     function _pruneResolved() internal {
         uint256 i;
         while (i < _activeMarkets.length) {
-            address pool = _activeMarkets[i].pool;
-            if (ITradePool(pool).poolFinalized()) {
+            uint256 mid = _activeMarkets[i].marketId;
+            if (settlement.getMarket(mid).resolved) {
                 _activeMarkets[i] = _activeMarkets[_activeMarkets.length - 1];
                 _activeMarkets.pop();
             } else {
