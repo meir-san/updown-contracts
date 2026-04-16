@@ -24,6 +24,7 @@ contract UpDownSettlement is Ownable {
     error NotDMM();
     error ZeroAddress();
     error Paused();
+    error InvalidMarketWindow();
 
     // ── Types ───────────────────────────────────────────────────────────
     /// @dev Packed for cheaper `createMarket` (fewer cold storage slots on first write).
@@ -121,15 +122,34 @@ contract UpDownSettlement is Ownable {
         whenNotPaused
         returns (uint256 marketId)
     {
-        marketId = ++nextMarketId;
         uint64 start = uint64(block.timestamp);
         uint64 end = start + uint64(duration);
+        return _createMarket(pairId, duration, strikePrice, start, end);
+    }
+
+    function createMarket(bytes32 pairId, uint256 duration, int256 strikePrice, uint64 startTime, uint64 endTime)
+        external
+        onlyAutocycler
+        whenNotPaused
+        returns (uint256 marketId)
+    {
+        return _createMarket(pairId, duration, strikePrice, startTime, endTime);
+    }
+
+    function _createMarket(bytes32 pairId, uint256 duration, int256 strikePrice, uint64 startTime, uint64 endTime)
+        internal
+        returns (uint256 marketId)
+    {
+        if (uint256(endTime) < uint256(startTime)) revert InvalidMarketWindow();
+        if (uint256(endTime) - uint256(startTime) != duration) revert InvalidMarketWindow();
+
+        marketId = ++nextMarketId;
         markets[marketId] = Market({
             pairId: pairId,
             totalUp: 0,
             totalDown: 0,
-            startTime: start,
-            endTime: end,
+            startTime: startTime,
+            endTime: endTime,
             duration: uint32(duration),
             winner: 0,
             resolved: false,
@@ -137,7 +157,7 @@ contract UpDownSettlement is Ownable {
             strikePrice: int128(strikePrice),
             settlementPrice: 0
         });
-        emit MarketCreated(marketId, pairId, duration, strikePrice, start, end);
+        emit MarketCreated(marketId, pairId, duration, strikePrice, startTime, endTime);
     }
 
     function enterPosition(uint256 marketId, uint8 option, uint256 amount)

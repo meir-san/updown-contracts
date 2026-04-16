@@ -60,15 +60,21 @@ contract DeployUpDown is Script {
         settlement.setRelayer(relayer);
 
         resolver.setAuthorizedCaller(address(cycler), true);
-        cycler.addPair(ETHUSD);
 
         vm.stopBroadcast();
 
+        uint256 ts = block.timestamp;
+        console.log("");
+        console.log("Clock-aligned market boundaries at deploy block.timestamp:");
+        console.log("  5m slot start (unix):", (ts / 300) * 300);
+        console.log("  15m slot start (unix):", (ts / 900) * 900);
+        console.log("  60m slot start (unix):", (ts / 3600) * 3600);
+        console.log("(Add ETH/USD to cycling via owner addPair if desired.)");
         console.log("");
         console.log("=== Deployment complete ===");
         console.log("UpDownSettlement:", address(settlement));
         console.log("ChainlinkResolver:", address(resolver));
         console.log("UpDownAutoCycler:", address(cycler));
-        console.log("Next: register UpDownAutoCycler on Chainlink Automation, fund LINK, verify on Arbiscan");
+        console.log("Next: register UpDownAutoCycler on Chainlink Automation, fund 5-10 LINK, verify on Arbiscan");
     }
 }

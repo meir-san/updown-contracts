@@ -84,6 +84,10 @@ contract UpDownAutoCyclerHarness is UpDownAutoCycler {
     function harnessPushActive(uint256 marketId, uint256 endTime, bytes32 pairId) external {
         _activeMarkets.push(ActiveMarket({marketId: marketId, endTime: endTime, pairId: pairId}));
     }
+
+    function harnessCreateMarket(uint256 tfIdx, bytes32 pairId) external {
+        _createMarket(tfIdx, pairId);
+    }
 }
 
 contract UpDownUnit is Test {
@@ -91,6 +95,20 @@ contract UpDownUnit is Test {
 
     function setUp() public {
         vm.warp(1_700_000_000);
+    }
+
+    /// @dev Full stack: resolver + settlement + harness cycler (BTC only), automation caller authorized.
+    function _deployCyclerSystem() internal returns (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) {
+        MockSequencerUp seq = new MockSequencerUp(0, block.timestamp - 2 hours);
+        MockBtcFeed feed = new MockBtcFeed(50_000e8);
+        ERC20Mock usdt = new ERC20Mock();
+        settlement = new UpDownSettlement(usdt, owner, 70, 80);
+        ChainlinkResolver r =
+            new ChainlinkResolver(owner, address(seq), BTCUSD, address(feed), bytes32(0), address(0), address(settlement));
+        settlement.setResolver(address(r));
+        cycler = new UpDownAutoCyclerHarness(owner, address(r), address(settlement));
+        settlement.setAutocycler(address(cycler));
+        r.setAuthorizedCaller(address(cycler), true);
     }
 
     function test_resolveTieGoesDown() public {
@@ -194,10 +212,60 @@ contract UpDownUnit is Test {
 
         assertEq(cycler.activeMarketCount(), 0, "all creates fail; nothing active");
     }
+
+    /// @notice Same idea as "12:01:30": 90s after a 5-minute boundary; market snaps to the slot start.
+    function test_clockAlignedFiveMin_intraSlotCreation() public {
+        uint256 ts = 1_234_567_890;
+        assertEq(ts % 300, 90);
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
+
+        cycler.harnessCreateMarket(0, BTCUSD);
+
+        uint256 slotStart = (ts / 300) * 300;
+        UpDownSettlement.Market memory m = settlement.getMarket(1);
+        assertEq(uint256(m.startTime), slotStart, "start = floor(now/300)*300");
+        assertEq(uint256(m.endTime), slotStart + 300, "end = next 5m boundary");
+    }
+
+    function test_clockAligned_multiTimeframe_sharedBoundary() public {
+        uint256 ts = 1_234_567_890;
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
+
+        uint256 b5 = (ts / 300) * 300;
+        uint256 b15 = (ts / 900) * 900;
+        assertEq(b5, b15, "fixture: 5m and 15m boundaries coincide");
+
+        cycler.harnessCreateMarket(0, BTCUSD);
+        cycler.harnessCreateMarket(1, BTCUSD);
+
+        UpDownSettlement.Market memory m5 = settlement.getMarket(1);
+        UpDownSettlement.Market memory m15 = settlement.getMarket(2);
+        assertEq(m5.startTime, m15.startTime);
+        assertEq(uint256(m5.endTime), b5 + 300);
+        assertEq(uint256(m15.endTime), b15 + 900);
+    }
+
+    function test_pairTfLastCreated_storesBoundaryNotBlockTimestamp() public {
+        uint256 ts = 1_234_567_890;
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
+
+        cycler.harnessCreateMarket(0, BTCUSD);
+
+        uint256 boundary = (ts / 300) * 300;
+        assertEq(cycler.pairTfLastCreated(BTCUSD, 0), boundary);
+        assertTrue(cycler.pairTfLastCreated(BTCUSD, 0) != ts);
+    }
 }
 
 contract RevertingSettlement {
     function createMarket(bytes32, uint256, int256) external pure returns (uint256) {
+        revert("no create");
+    }
+
+    function createMarket(bytes32, uint256, int256, uint64, uint64) external pure returns (uint256) {
         revert("no create");
     }
 

@@ -9,7 +9,7 @@ import {ChainlinkResolver} from "./ChainlinkResolver.sol";
 
 /// @title UpDownAutoCycler
 /// @notice Chainlink Automation-compatible keeper that auto-creates and auto-resolves
-///         UpDown prediction markets (e.g. BTC/USD, ETH/USD) on 5, 15, and 60-minute cycles.
+///         UpDown prediction markets (e.g. BTC/USD) on 5, 15, and 60-minute cycles.
 ///         Markets are created inside a single `UpDownSettlement` contract (no per-market deploy).
 contract UpDownAutoCycler is Ownable {
     using SafeERC20 for IERC20;
@@ -60,7 +60,7 @@ contract UpDownAutoCycler is Ownable {
     bytes32[] internal _cyclingPairs;
     mapping(bytes32 => bool) public isCyclingPair;
 
-    /// @notice Last `block.timestamp` when a market was created for (pairId, timeframeIndex).
+    /// @notice Start timestamp of the last created slot (clock-aligned boundary) per (pairId, timeframeIndex).
     mapping(bytes32 => mapping(uint256 => uint256)) public pairTfLastCreated;
 
     // ── Constructor ─────────────────────────────────────────────────────
@@ -191,13 +191,18 @@ contract UpDownAutoCycler is Ownable {
 
         int256 strike = resolver.getPrice(pairId);
 
-        uint256 end = block.timestamp + tf.duration;
+        uint256 nowTs = block.timestamp;
+        uint256 currentBoundary = (nowTs / tf.duration) * tf.duration;
+        uint256 nextBoundary = currentBoundary + tf.duration;
 
-        uint256 marketId = settlement.createMarket(pairId, tf.duration, strike);
+        uint256 start = currentBoundary;
+        uint256 end = nextBoundary;
+
+        uint256 marketId = settlement.createMarket(pairId, tf.duration, strike, uint64(start), uint64(end));
 
         resolver.registerMarket(marketId, address(settlement), pairId, strike);
         _activeMarkets.push(ActiveMarket({marketId: marketId, endTime: end, pairId: pairId}));
-        pairTfLastCreated[pairId][tfIdx] = block.timestamp;
+        pairTfLastCreated[pairId][tfIdx] = currentBoundary;
 
         emit MarketCreated(marketId, pairId, tf.duration, strike);
     }

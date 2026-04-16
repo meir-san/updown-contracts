@@ -43,7 +43,6 @@ contract UpDownForkTest is Test {
         settlement.setRelayer(owner);
 
         resolver.setAuthorizedCaller(address(cycler), true);
-        cycler.addPair(ETHUSD);
 
         usdt.mint(owner, 10_000_000e18);
         usdt.approve(address(settlement), type(uint256).max);
