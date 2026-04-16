@@ -3,15 +3,13 @@ pragma solidity ^0.8.29;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
-import {ITradePool} from "./interfaces/ITradePool.sol";
+import {IUpDownSettlement} from "./interfaces/IUpDownSettlement.sol";
 
 /// @title ChainlinkResolver
 /// @notice Reads Chainlink price feeds on Arbitrum, validates the L2 sequencer,
-///         and resolves RAIN UpDown markets by calling closePool() + chooseWinner().
-///         Set as the `poolResolver` on every UpDown market so only this contract
-///         can call chooseWinner (enforced by the pool's OnlyResolver guard).
-///         Resolution is permissionless — anyone can call resolve() since the
-///         outcome is deterministic from the Chainlink feed.
+///         and resolves UpDown markets via `UpDownSettlement.resolve`.
+///         Resolution is permissionless — anyone can call `resolve` since the
+///         outcome is deterministic from the Chainlink feed (UP if price > strike, else DOWN; tie => DOWN).
 contract ChainlinkResolver is Ownable {
     // ── Errors ──────────────────────────────────────────────────────────
     error FeedNotConfigured();
@@ -21,15 +19,18 @@ contract ChainlinkResolver is Ownable {
     error MarketNotRegistered();
     error MarketNotExpired();
     error AlreadyResolved();
+    error TrustedSettlementMismatch();
+    error ZeroTrustedSettlement();
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
-    event MarketRegistered(address indexed pool, bytes32 indexed pairId, int256 strikePrice);
-    event MarketResolved(address indexed pool, uint256 winningOption, int256 settlementPrice, int256 strikePrice);
+    event MarketRegistered(uint256 indexed marketId, address indexed settlement, bytes32 indexed pairId, int256 strikePrice);
+    event MarketResolved(uint256 indexed marketId, uint256 winningOption, int256 settlementPrice, int256 strikePrice);
     event AuthorizedCallerSet(address indexed caller, bool authorized);
 
     // ── Types ───────────────────────────────────────────────────────────
     struct MarketInfo {
+        address settlement;
         bytes32 pairId;
         int256 strikePrice;
         bool resolved;
@@ -43,9 +44,10 @@ contract ChainlinkResolver is Ownable {
 
     // ── State ───────────────────────────────────────────────────────────
     AggregatorV3Interface public immutable sequencerFeed;
+    address public immutable trustedSettlement;
 
     mapping(bytes32 => address) public priceFeeds;
-    mapping(address => MarketInfo) public markets;
+    mapping(uint256 => MarketInfo) public markets;
     mapping(address => bool) public authorizedCallers;
 
     // ── Constructor ─────────────────────────────────────────────────────
@@ -55,8 +57,11 @@ contract ChainlinkResolver is Ownable {
         bytes32 _btcUsdPairId,
         address _btcUsdFeed,
         bytes32 _ethUsdPairId,
-        address _ethUsdFeed
+        address _ethUsdFeed,
+        address _trustedSettlement
     ) Ownable(_owner) {
+        if (_trustedSettlement == address(0)) revert ZeroTrustedSettlement();
+        trustedSettlement = _trustedSettlement;
         sequencerFeed = AggregatorV3Interface(_sequencerFeed);
 
         priceFeeds[_btcUsdPairId] = _btcUsdFeed;
@@ -80,12 +85,16 @@ contract ChainlinkResolver is Ownable {
     }
 
     // ── Authorized: market registration ─────────────────────────────────
-    function registerMarket(address pool, bytes32 pairId, int256 strikePrice) external {
+    function registerMarket(uint256 marketId, address settlement, bytes32 pairId, int256 strikePrice) external {
         require(authorizedCallers[msg.sender] || msg.sender == owner(), "unauthorized");
-        require(priceFeeds[pairId] != address(0), FeedNotConfigured());
+        if (settlement != trustedSettlement) revert TrustedSettlementMismatch();
+        if (priceFeeds[pairId] == address(0)) revert FeedNotConfigured();
 
-        markets[pool] = MarketInfo({pairId: pairId, strikePrice: strikePrice, resolved: false});
-        emit MarketRegistered(pool, pairId, strikePrice);
+        IUpDownSettlement.Market memory sm = IUpDownSettlement(settlement).getMarket(marketId);
+        if (sm.startTime == 0 || sm.pairId != pairId || int256(sm.strikePrice) != strikePrice) revert MarketNotRegistered();
+
+        markets[marketId] = MarketInfo({settlement: settlement, pairId: pairId, strikePrice: strikePrice, resolved: false});
+        emit MarketRegistered(marketId, settlement, pairId, strikePrice);
     }
 
     // ── Public: price reading ───────────────────────────────────────────
@@ -97,23 +106,24 @@ contract ChainlinkResolver is Ownable {
     }
 
     // ── Public: permissionless resolution ────────────────────────────────
-    function resolve(address pool) external {
-        MarketInfo storage info = markets[pool];
-        require(info.pairId != bytes32(0), MarketNotRegistered());
-        require(!info.resolved, AlreadyResolved());
-        require(block.timestamp >= ITradePool(pool).endTime(), MarketNotExpired());
+    function resolve(uint256 marketId) external {
+        MarketInfo storage info = markets[marketId];
+        if (info.settlement == address(0)) revert MarketNotRegistered();
+        if (info.resolved) revert AlreadyResolved();
+
+        IUpDownSettlement.Market memory m = IUpDownSettlement(info.settlement).getMarket(marketId);
+        if (block.timestamp < uint256(m.endTime)) revert MarketNotExpired();
 
         _checkSequencer();
         int256 settlementPrice = _getLatestPrice(info.pairId);
 
         uint256 winningOption = settlementPrice > info.strikePrice ? OPTION_UP : OPTION_DOWN;
 
-        try ITradePool(pool).closePool() {} catch {}
-        try ITradePool(pool).chooseWinner(winningOption) {
+        try IUpDownSettlement(info.settlement).resolve(marketId, settlementPrice, uint8(winningOption)) {
             info.resolved = true;
-            emit MarketResolved(pool, winningOption, settlementPrice, info.strikePrice);
+            emit MarketResolved(marketId, winningOption, settlementPrice, info.strikePrice);
         } catch {
-            // Leave resolved = false so resolve() can be retried after the pool is fixed.
+            // Leave resolved = false so resolve() can be retried.
         }
     }
 
