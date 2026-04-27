@@ -4,11 +4,16 @@ pragma solidity ^0.8.29;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 /// @title UpDownSettlement
 /// @notice Single contract holding all UpDown markets as storage entries (no per-market proxy).
-///         Relayer aggregates matched volume; resolver sets outcomes after expiry.
-contract UpDownSettlement is Ownable {
+///         Orders are signed by makers off-chain via EIP-712; any caller may submit a signed
+///         fill through `enterPosition`, which verifies the signature, tracks cumulative fills
+///         against the signed amount (partial fills allowed), and pulls USDT from the maker.
+///         Resolver sets outcomes after expiry; relayer withdraws settled pools.
+contract UpDownSettlement is Ownable, EIP712 {
     using SafeERC20 for IERC20;
 
     // ── Errors ──────────────────────────────────────────────────────────
@@ -25,6 +30,12 @@ contract UpDownSettlement is Ownable {
     error ZeroAddress();
     error Paused();
     error InvalidMarketWindow();
+    error OrderExpired();
+    error InvalidSignature();
+    error FillExceedsOrderAmount();
+    error InvalidSide();
+    error MarketMismatch();
+    error OptionMismatch();
 
     // ── Types ───────────────────────────────────────────────────────────
     /// @dev Packed for cheaper `createMarket` (fewer cold storage slots on first write).
@@ -42,6 +53,27 @@ contract UpDownSettlement is Ownable {
         int128 settlementPrice;
     }
 
+    /// @dev EIP-712 Order struct mirroring the off-chain matching engine's typed-data shape.
+    ///      `orderType` is named to avoid Solidity's `type` keyword collision; the EIP-712
+    ///      typehash string below uses "type" to match the backend's signed payloads verbatim.
+    ///      Side is 0=BUY, 1=SELL. Only BUY orders enter positions — sellers are settled
+    ///      off-chain via the backend's Mongo ledger.
+    struct Order {
+        address maker;
+        uint256 market;
+        uint256 option;
+        uint8 side;
+        uint8 orderType;
+        uint256 price;
+        uint256 amount;
+        uint256 nonce;
+        uint256 expiry;
+    }
+
+    bytes32 public constant ORDER_TYPEHASH = keccak256(
+        "Order(address maker,uint256 market,uint256 option,uint8 side,uint8 type,uint256 price,uint256 amount,uint256 nonce,uint256 expiry)"
+    );
+
     // ── Events ──────────────────────────────────────────────────────────
     event MarketCreated(
         uint256 indexed marketId,
@@ -51,7 +83,7 @@ contract UpDownSettlement is Ownable {
         uint256 startTime,
         uint256 endTime
     );
-    event PositionEntered(uint256 indexed marketId, uint8 option, uint256 amount);
+    event PositionEntered(uint256 indexed marketId, uint8 option, uint256 amount, address indexed maker);
     event MarketResolved(uint256 indexed marketId, uint8 winner, int256 settlementPrice);
     event SettlementWithdrawn(uint256 indexed marketId, uint256 netToRelayer, uint256 fees);
     event DMMAdded(address indexed dmm);
@@ -83,6 +115,10 @@ contract UpDownSettlement is Ownable {
     uint256 public totalAccumulatedFees;
     bool public paused;
 
+    /// @notice Cumulative filled amount per signed order hash. Caps at `order.amount` to
+    ///         prevent over-fill; replays that would push total past the signed max revert.
+    mapping(bytes32 => uint256) public orderFills;
+
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyAutocycler() {
         if (msg.sender != autocycler) revert OnlyAutocycler();
@@ -107,6 +143,7 @@ contract UpDownSettlement is Ownable {
     // ── Constructor ─────────────────────────────────────────────────────
     constructor(IERC20 _usdt, address initialOwner, uint256 _platformFeeBps, uint256 _makerFeeBps)
         Ownable(initialOwner)
+        EIP712("UpDown Exchange", "1")
     {
         if (address(_usdt) == address(0)) revert ZeroAddress();
         usdt = _usdt;
@@ -160,23 +197,91 @@ contract UpDownSettlement is Ownable {
         emit MarketCreated(marketId, pairId, duration, strikePrice, startTime, endTime);
     }
 
-    function enterPosition(uint256 marketId, uint8 option, uint256 amount)
-        external
-        onlyRelayer
-        whenNotPaused
-    {
-        if (option != 1 && option != 2) revert InvalidOption();
+    /// @notice EIP-712 struct hash for a given Order. Exposed for off-chain tooling.
+    function hashOrder(Order memory order) public pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                ORDER_TYPEHASH,
+                order.maker,
+                order.market,
+                order.option,
+                order.side,
+                order.orderType,
+                order.price,
+                order.amount,
+                order.nonce,
+                order.expiry
+            )
+        );
+    }
+
+    /// @notice EIP-712 digest including domain separator. Exposed for off-chain tooling.
+    function orderDigest(Order memory order) public view returns (bytes32) {
+        return _hashTypedDataV4(hashOrder(order));
+    }
+
+    /// @notice Submit a signed BUY order as a fill against a market. Anyone may call.
+    ///         Signature must recover to `order.maker`. Cumulative fills per signed order are
+    ///         tracked on-chain and cannot exceed `order.amount`.
+    /// @param order      The EIP-712 Order the maker signed off-chain.
+    /// @param signature  65-byte secp256k1 signature by `order.maker`.
+    /// @param marketId   Must equal `order.market`. Redundant in args but matches the
+    ///                   backend's existing calldata shape for simpler migration.
+    /// @param option     Must equal `order.option`. Same reason as `marketId`.
+    /// @param fillAmount Amount to enter for this call. May be less than `order.amount`
+    ///                   (partial fill); subsequent calls with same signature may top up.
+    function enterPosition(
+        Order calldata order,
+        bytes calldata signature,
+        uint256 marketId,
+        uint8 option,
+        uint256 fillAmount
+    ) external whenNotPaused {
+        // Arg/order consistency (prevents calldata from asking for one market while sig
+        // was for another, even though sig itself ties those fields).
+        if (marketId != order.market) revert MarketMismatch();
+        if (uint256(option) != order.option) revert OptionMismatch();
+
+        if (block.timestamp > order.expiry) revert OrderExpired();
+        if (order.option != 1 && order.option != 2) revert InvalidOption();
+        if (order.side != 0) revert InvalidSide(); // 0 = BUY; sellers settled off-chain
+        if (fillAmount == 0) revert FillExceedsOrderAmount();
+
+        // Verify maker's EIP-712 signature over the Order. SignatureChecker
+        // handles BOTH plain EOAs (via ECDSA.recover internally) AND contract
+        // accounts that implement ERC-1271 (e.g. Alchemy MA v2 smart accounts:
+        // order.maker IS the SA address; the SA's `isValidSignature` delegates
+        // to its EOA owner). Required because user USDT lives on the SA, so
+        // `transferFrom(order.maker, ...)` below pulls from the SA — meaning
+        // `maker` must be the SA. EOA-only `ECDSA.recover` would never accept
+        // an SA as the recovered address. This is the prediction-market-
+        // standard pattern (Polymarket, etc.).
+        bytes32 structHash = hashOrder(order);
+        bytes32 digest = _hashTypedDataV4(structHash);
+        if (!SignatureChecker.isValidSignatureNow(order.maker, digest, signature)) {
+            revert InvalidSignature();
+        }
+
+        // Partial-fill bookkeeping: cumulative filled must not exceed signed amount.
+        uint256 already = orderFills[structHash];
+        uint256 newFilled = already + fillAmount;
+        if (newFilled > order.amount) revert FillExceedsOrderAmount();
+        orderFills[structHash] = newFilled;
+
+        // Market must be active.
         Market storage m = markets[marketId];
         if (m.startTime == 0) revert MarketNotOpen();
         if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
 
-        usdt.safeTransferFrom(msg.sender, address(this), amount);
-        if (option == 1) {
-            m.totalUp += uint128(amount);
+        // Pull USDT from maker's account. Maker must have approved this contract.
+        usdt.safeTransferFrom(order.maker, address(this), fillAmount);
+
+        if (order.option == 1) {
+            m.totalUp += uint128(fillAmount);
         } else {
-            m.totalDown += uint128(amount);
+            m.totalDown += uint128(fillAmount);
         }
-        emit PositionEntered(marketId, option, amount);
+        emit PositionEntered(marketId, uint8(order.option), fillAmount, order.maker);
     }
 
     function resolve(uint256 marketId, int256 settlementPrice, uint8 winner) external onlyResolver whenNotPaused {
@@ -294,5 +399,21 @@ contract UpDownSettlement is Ownable {
 
     function getMarket(uint256 marketId) external view returns (Market memory) {
         return markets[marketId];
+    }
+
+    /// @notice Remaining signed amount available for further fills on this order.
+    function orderRemaining(Order calldata order) external view returns (uint256) {
+        bytes32 h = hashOrder(order);
+        uint256 filled = orderFills[h];
+        if (filled >= order.amount) return 0;
+        unchecked {
+            return order.amount - filled;
+        }
+    }
+
+    /// @notice Public getter matching the EIP-712 domain separator spec. Useful for
+    ///         off-chain signing libraries that want to verify the domain they'll hash.
+    function DOMAIN_SEPARATOR() external view returns (bytes32) {
+        return _domainSeparatorV4();
     }
 }
