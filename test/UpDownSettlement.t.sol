@@ -452,13 +452,26 @@ contract UpDownSettlementTest is Test {
         address dmm = address(0xd00);
         s.addDMM(dmm);
 
-        usdt.mint(relayer, 100e18);
-        vm.startPrank(relayer);
-        usdt.approve(address(s), type(uint256).max);
+        // PR-16 (P1-15): rebate funding now sources from accumulated fees
+        // rather than pulling from the relayer's external wallet. Run a
+        // settlement first so totalAccumulatedFees > 0, then accumulate.
+        vm.prank(autocycler);
+        uint256 mid = s.createMarket(PAIR, 300, 1e18);
+        _fill(mid, 1, 1000e18, 60);
+        _fill(mid, 2, 1000e18, 61);
+        vm.warp(block.timestamp + 301);
+        vm.prank(resolver);
+        s.resolve(mid, 2e18, 1);
+        vm.prank(relayer);
+        s.withdrawSettlement(mid);
+        uint256 feesBefore = s.totalAccumulatedFees();
+        require(feesBefore >= 5e18, "fixture: fees too small");
+
+        vm.prank(relayer);
         s.accumulateRebate(dmm, 5e18);
-        vm.stopPrank();
 
         assertEq(s.dmmRebateAccumulated(dmm), 5e18);
+        assertEq(s.totalAccumulatedFees(), feesBefore - 5e18);
 
         vm.prank(dmm);
         s.claimRebate();
@@ -486,12 +499,11 @@ contract UpDownSettlementTest is Test {
     }
 
     function test_accumulateRebateNotDmmReverts() public {
-        usdt.mint(relayer, 10e18);
-        vm.startPrank(relayer);
-        usdt.approve(address(s), type(uint256).max);
+        // PR-16: relayer's external balance no longer matters here. Just
+        // ensure the not-DMM path reverts without funding the contract.
+        vm.prank(relayer);
         vm.expectRevert(UpDownSettlement.NotDMM.selector);
         s.accumulateRebate(address(0x123), 1e18);
-        vm.stopPrank();
     }
 
     function test_ownerWithdrawFees() public {
@@ -509,5 +521,139 @@ contract UpDownSettlementTest is Test {
         uint256 beforeB = usdt.balanceOf(deployerAddr);
         s.withdrawFees(fees);
         assertEq(usdt.balanceOf(deployerAddr), beforeB + fees);
+        // PR-16 (P1-16): counter decrements in lockstep with the transfer.
+        assertEq(s.totalAccumulatedFees(), 0);
+    }
+
+    // ── PR-16 (P1-15 + P1-16 + P1-17 + P1-18) ─────────────────────────
+
+    /// @dev Helper: settle one market so the contract has a non-zero
+    ///      totalAccumulatedFees + matching USDT balance to draw from.
+    function _settleOneMarketForFees() internal returns (uint256 feesAfter) {
+        vm.prank(autocycler);
+        uint256 mid = s.createMarket(PAIR, 300, 1e18);
+        _fill(mid, 1, 1000e18, 70);
+        _fill(mid, 2, 1000e18, 71);
+        vm.warp(block.timestamp + 301);
+        vm.prank(resolver);
+        s.resolve(mid, 2e18, 1);
+        vm.prank(relayer);
+        s.withdrawSettlement(mid);
+        return s.totalAccumulatedFees();
+    }
+
+    function test_pr16_accumulateRebate_revertsWhenAmountExceedsFees() public {
+        address dmm = address(0xd00);
+        s.addDMM(dmm);
+        // No prior settlement → totalAccumulatedFees == 0.
+        vm.prank(relayer);
+        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
+        s.accumulateRebate(dmm, 1);
+    }
+
+    function test_pr16_accumulateRebate_decrementsAccumulator() public {
+        address dmm = address(0xd00);
+        s.addDMM(dmm);
+        uint256 fees = _settleOneMarketForFees();
+        require(fees >= 1e18, "fixture: need >= 1 USDT in fees");
+        uint256 before = s.totalAccumulatedFees();
+
+        vm.prank(relayer);
+        s.accumulateRebate(dmm, 1e18);
+
+        assertEq(s.totalAccumulatedFees(), before - 1e18);
+        assertEq(s.dmmRebateAccumulated(dmm), 1e18);
+    }
+
+    function test_pr16_withdrawFees_revertsWhenAmountExceedsAccumulator() public {
+        uint256 fees = _settleOneMarketForFees();
+        // Try to over-withdraw by 1.
+        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
+        s.withdrawFees(fees + 1);
+    }
+
+    function test_pr16_withdrawFees_emitsEventWithTotalAfter() public {
+        uint256 fees = _settleOneMarketForFees();
+        vm.expectEmit(true, false, false, true);
+        emit UpDownSettlement.FeesWithdrawn(address(this), fees, 0);
+        s.withdrawFees(fees);
+    }
+
+    function test_pr16_getAccumulatedFees_matchesStorage() public {
+        uint256 fees = _settleOneMarketForFees();
+        assertEq(s.getAccumulatedFees(), fees);
+    }
+
+    function test_pr16_emergencyWithdraw_proposeThenExecuteAfter24h() public {
+        // Seed the contract with some USDT to withdraw (via the fee path).
+        _settleOneMarketForFees();
+        uint256 contractBalanceBefore = usdt.balanceOf(address(s));
+        require(contractBalanceBefore >= 1e18, "fixture: need balance");
+
+        address recipient = makeAddr("recipient");
+        bytes32 proposalId = s.proposeEmergencyWithdraw(address(usdt), recipient, 1e18);
+        // Immediate execute fails — timelock not yet elapsed.
+        vm.expectRevert(UpDownSettlement.EmergencyTimelockActive.selector);
+        s.executeEmergencyWithdraw(proposalId);
+
+        vm.warp(block.timestamp + 24 hours);
+        s.executeEmergencyWithdraw(proposalId);
+
+        assertEq(usdt.balanceOf(recipient), 1e18);
+        assertEq(usdt.balanceOf(address(s)), contractBalanceBefore - 1e18);
+        // Proposal cleared after execute.
+        (,,, uint256 unlocksAt) = s.emergencyProposals(proposalId);
+        assertEq(unlocksAt, 0);
+    }
+
+    function test_pr16_emergencyWithdraw_revertsBeforeTimelock() public {
+        _settleOneMarketForFees();
+        bytes32 proposalId = s.proposeEmergencyWithdraw(address(usdt), makeAddr("r"), 1e18);
+        vm.warp(block.timestamp + 23 hours + 59 minutes);
+        vm.expectRevert(UpDownSettlement.EmergencyTimelockActive.selector);
+        s.executeEmergencyWithdraw(proposalId);
+    }
+
+    function test_pr16_emergencyWithdraw_canBeCancelled() public {
+        _settleOneMarketForFees();
+        bytes32 proposalId = s.proposeEmergencyWithdraw(address(usdt), makeAddr("r"), 1e18);
+        s.cancelEmergencyWithdraw(proposalId);
+        // Subsequent execute reverts as not-found.
+        vm.warp(block.timestamp + 24 hours);
+        vm.expectRevert(UpDownSettlement.EmergencyProposalNotFound.selector);
+        s.executeEmergencyWithdraw(proposalId);
+    }
+
+    function test_pr16_emergencyWithdraw_executeUnknownProposalReverts() public {
+        bytes32 fakeId = keccak256("not-a-real-proposal");
+        vm.expectRevert(UpDownSettlement.EmergencyProposalNotFound.selector);
+        s.executeEmergencyWithdraw(fakeId);
+    }
+
+    function test_pr16_emergencyWithdraw_zeroAddressReverts() public {
+        vm.expectRevert(UpDownSettlement.ZeroAddress.selector);
+        s.proposeEmergencyWithdraw(address(0), makeAddr("r"), 1);
+        vm.expectRevert(UpDownSettlement.ZeroAddress.selector);
+        s.proposeEmergencyWithdraw(address(usdt), address(0), 1);
+    }
+
+    function test_pr16_emergencyWithdraw_onlyOwner() public {
+        address attacker = makeAddr("attacker");
+        vm.startPrank(attacker);
+        vm.expectRevert();
+        s.proposeEmergencyWithdraw(address(usdt), attacker, 1);
+        vm.expectRevert();
+        s.executeEmergencyWithdraw(bytes32(0));
+        vm.expectRevert();
+        s.cancelEmergencyWithdraw(bytes32(0));
+        vm.stopPrank();
+    }
+
+    function test_pr16_emergencyWithdraw_distinctNonceForIdenticalProposals() public {
+        _settleOneMarketForFees();
+        address recipient = makeAddr("r");
+        bytes32 a = s.proposeEmergencyWithdraw(address(usdt), recipient, 1e18);
+        bytes32 b = s.proposeEmergencyWithdraw(address(usdt), recipient, 1e18);
+        assertTrue(a != b, "monotonic nonce keeps two identical proposals distinct");
     }
 }

@@ -27,6 +27,13 @@ contract ChainlinkResolver is Ownable {
     event MarketRegistered(uint256 indexed marketId, address indexed settlement, bytes32 indexed pairId, int256 strikePrice);
     event MarketResolved(uint256 indexed marketId, uint256 winningOption, int256 settlementPrice, int256 strikePrice);
     event AuthorizedCallerSet(address indexed caller, bool authorized);
+    /// @notice PR-16 (P1-18): emitted when the inner `IUpDownSettlement.resolve`
+    ///         call reverts. Pre-fix the revert was swallowed silently, so a
+    ///         broken settlement contract or a stuck market produced no
+    ///         on-chain signal — operators only noticed when off-chain
+    ///         reconciliation flagged the missed payout. `reason` carries the
+    ///         raw revert bytes for off-chain decoding.
+    event ResolveFailed(uint256 indexed marketId, int256 settlementPrice, bytes reason);
 
     // ── Types ───────────────────────────────────────────────────────────
     struct MarketInfo {
@@ -122,8 +129,11 @@ contract ChainlinkResolver is Ownable {
         try IUpDownSettlement(info.settlement).resolve(marketId, settlementPrice, uint8(winningOption)) {
             info.resolved = true;
             emit MarketResolved(marketId, winningOption, settlementPrice, info.strikePrice);
-        } catch {
-            // Leave resolved = false so resolve() can be retried.
+        } catch (bytes memory reason) {
+            // PR-16 (P1-18): leave resolved = false so resolve() can be
+            // retried, but emit so operators see the failure on-chain
+            // instead of in off-chain reconciliation logs only.
+            emit ResolveFailed(marketId, settlementPrice, reason);
         }
     }
 
