@@ -33,6 +33,11 @@ contract UpDownSettlement is Ownable, EIP712 {
     error OrderExpired();
     error InvalidSignature();
     error FillExceedsOrderAmount();
+    // PR-16 (P1-15 + P1-16 + P1-17): cleanup batch
+    error InsufficientAccumulatedFees();
+    error EmergencyProposalNotFound();
+    error EmergencyTimelockActive();
+    error EmergencyProposalAlreadyExists();
     error InvalidSide();
     error MarketMismatch();
     error OptionMismatch();
@@ -93,6 +98,12 @@ contract UpDownSettlement is Ownable, EIP712 {
     event PausedSet(bool paused);
     event FeesUpdated(uint256 platformFeeBps, uint256 makerFeeBps);
     event DmmRebateBpsUpdated(uint256 bps);
+    // PR-16 (P1-16): emit on owner withdraw + decrement counter atomically.
+    event FeesWithdrawn(address indexed to, uint256 amount, uint256 totalAfter);
+    // PR-16 (P1-17): two-step emergency withdraw with 24h timelock.
+    event EmergencyWithdrawProposed(address indexed token, address indexed to, uint256 amount, uint256 unlocksAt);
+    event EmergencyWithdrawExecuted(address indexed token, address indexed to, uint256 amount);
+    event EmergencyWithdrawCancelled(bytes32 indexed proposalId);
 
     // ── Immutables / roles ─────────────────────────────────────────────
     IERC20 public immutable usdt;
@@ -118,6 +129,23 @@ contract UpDownSettlement is Ownable, EIP712 {
     /// @notice Cumulative filled amount per signed order hash. Caps at `order.amount` to
     ///         prevent over-fill; replays that would push total past the signed max revert.
     mapping(bytes32 => uint256) public orderFills;
+
+    // ── PR-16 (P1-17) emergency-withdraw timelock ─────────────────────
+    /// @notice 24h delay between proposing and executing an emergency withdraw.
+    uint256 public constant EMERGENCY_TIMELOCK = 24 hours;
+
+    struct EmergencyProposal {
+        address token;
+        address to;
+        uint256 amount;
+        uint256 unlocksAt;
+    }
+
+    /// @notice Active proposals keyed by `keccak256(abi.encode(token, to, amount, nonce))`.
+    ///         Owner may have multiple in flight (different tokens / amounts).
+    mapping(bytes32 => EmergencyProposal) public emergencyProposals;
+    /// @notice Per-owner monotonic nonce so two identical proposals don't collide.
+    uint256 public emergencyProposalNonce;
 
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyAutocycler() {
@@ -339,9 +367,19 @@ contract UpDownSettlement is Ownable, EIP712 {
         emit DMMRemoved(dmm);
     }
 
+    /// @notice Credit a DMM's rebate accumulator from the contract's existing
+    ///         platform-fee balance (PR-16 / P1-15). Pre-fix this pulled
+    ///         external USDT from the relayer's wallet, decoupling rebate
+    ///         payments from the fee accumulation that was supposed to fund
+    ///         them. Now rebates come from `totalAccumulatedFees`, decremented
+    ///         atomically with the rebate credit.
     function accumulateRebate(address dmm, uint256 amount) external onlyRelayer whenNotPaused {
         if (!isDMM[dmm]) revert NotDMM();
-        usdt.safeTransferFrom(msg.sender, address(this), amount);
+        if (amount > totalAccumulatedFees) revert InsufficientAccumulatedFees();
+        unchecked {
+            // amount <= totalAccumulatedFees, no underflow.
+            totalAccumulatedFees -= amount;
+        }
         dmmRebateAccumulated[dmm] += amount;
         emit RebateAccumulated(dmm, amount);
     }
@@ -387,12 +425,71 @@ contract UpDownSettlement is Ownable, EIP712 {
         emit DmmRebateBpsUpdated(bps);
     }
 
+    /// @notice Pull accumulated platform/maker fees to the owner. Decrements
+    ///         the on-chain counter in lockstep so off-chain dashboards can
+    ///         trust `getAccumulatedFees()` (PR-16 / P1-16). Reverts if more
+    ///         than the accumulator is requested — prevents accidental drain
+    ///         of contract balance backing in-flight rebates or partially-filled
+    ///         orders.
     function withdrawFees(uint256 amount) external onlyOwner {
+        if (amount > totalAccumulatedFees) revert InsufficientAccumulatedFees();
+        unchecked {
+            totalAccumulatedFees -= amount;
+        }
         usdt.safeTransfer(msg.sender, amount);
+        emit FeesWithdrawn(msg.sender, amount, totalAccumulatedFees);
     }
 
-    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
-        IERC20(token).safeTransfer(msg.sender, amount);
+    /// @notice Read accumulated fees available for withdraw. Pure convenience —
+    ///         the public storage slot is already readable, but a typed getter
+    ///         is clearer for ABI consumers and dashboards.
+    function getAccumulatedFees() external view returns (uint256) {
+        return totalAccumulatedFees;
+    }
+
+    /// @notice Step 1 of emergency withdraw (PR-16 / P1-17). Records intent
+    ///         and a 24-hour unlock timestamp; nothing transfers yet. Audit
+    ///         signal: any unexpected proposal is visible on-chain immediately
+    ///         and operators have a full day to react before funds can move.
+    function proposeEmergencyWithdraw(address token, address to, uint256 amount)
+        external
+        onlyOwner
+        returns (bytes32 proposalId)
+    {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        unchecked {
+            ++emergencyProposalNonce;
+        }
+        proposalId = keccak256(abi.encode(token, to, amount, emergencyProposalNonce));
+        if (emergencyProposals[proposalId].unlocksAt != 0) revert EmergencyProposalAlreadyExists();
+        uint256 unlocksAt = block.timestamp + EMERGENCY_TIMELOCK;
+        emergencyProposals[proposalId] = EmergencyProposal({
+            token: token,
+            to: to,
+            amount: amount,
+            unlocksAt: unlocksAt
+        });
+        emit EmergencyWithdrawProposed(token, to, amount, unlocksAt);
+    }
+
+    /// @notice Step 2 of emergency withdraw — executes the transfer iff at
+    ///         least 24 hours have passed since the proposal landed.
+    function executeEmergencyWithdraw(bytes32 proposalId) external onlyOwner {
+        EmergencyProposal memory p = emergencyProposals[proposalId];
+        if (p.unlocksAt == 0) revert EmergencyProposalNotFound();
+        if (block.timestamp < p.unlocksAt) revert EmergencyTimelockActive();
+        delete emergencyProposals[proposalId];
+        IERC20(p.token).safeTransfer(p.to, p.amount);
+        emit EmergencyWithdrawExecuted(p.token, p.to, p.amount);
+    }
+
+    /// @notice Cancel a pending emergency-withdraw proposal. Owner-only —
+    ///         the timelock is for human operator review, not a separate
+    ///         signer set.
+    function cancelEmergencyWithdraw(bytes32 proposalId) external onlyOwner {
+        if (emergencyProposals[proposalId].unlocksAt == 0) revert EmergencyProposalNotFound();
+        delete emergencyProposals[proposalId];
+        emit EmergencyWithdrawCancelled(proposalId);
     }
 
     // ── Views ───────────────────────────────────────────────────────────
