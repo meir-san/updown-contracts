@@ -5,6 +5,7 @@ import {Test, console} from "forge-std/Test.sol";
 import {ChainlinkResolver} from "../src/ChainlinkResolver.sol";
 import {UpDownAutoCycler} from "../src/UpDownAutoCycler.sol";
 import {UpDownSettlement} from "../src/UpDownSettlement.sol";
+import {AggregatorV3Interface} from "../src/interfaces/AggregatorV3Interface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "@openzeppelin/contracts/mocks/token/ERC20Mock.sol";
 
@@ -96,18 +97,42 @@ contract UpDownForkTest is Test {
         resolver.getPrice(BTCUSD);
     }
 
+    /// @dev PR-10 (P0-16): walk the live Chainlink BTC feed backwards from
+    ///      `latestRoundData()` to find the latest round whose `updatedAt <=
+    ///      endTime`, with the next round's `updatedAt > endTime`. Mirrors
+    ///      what the off-chain `ChainlinkResolverService` does. Bounded to
+    ///      512 hops to keep fork-test gas finite even on a stale feed.
+    function _findCanonicalRound(address feedAddr, uint256 endTime) internal view returns (uint80) {
+        AggregatorV3Interface feed = AggregatorV3Interface(feedAddr);
+        (uint80 latestId,,, uint256 latestUpdatedAt,) = feed.latestRoundData();
+        // If the feed hasn't produced a round AFTER endTime yet, no canonical
+        // round exists — the contract's nextRound > endTime check would fail.
+        // Fork tests warp +400s after endTime, so this should never trigger
+        // on a healthy mainnet feed; revert loud if it does.
+        require(latestUpdatedAt > endTime, "fork: latest round predates endTime");
+        uint80 r = latestId;
+        for (uint256 i = 0; i < 512 && r > 0; ++i) {
+            uint80 candidate = r - 1;
+            (, , , uint256 updatedAt, ) = feed.getRoundData(candidate);
+            if (updatedAt <= endTime) return candidate;
+            r = candidate;
+        }
+        revert("fork: canonical round not found in 512 hops");
+    }
+
     function test_resolveBeforeExpiryReverts() public {
         vm.prank(address(cycler));
         uint256 mid = settlement.createMarket(BTCUSD, 300, 50_000e8);
         resolver.registerMarket(mid, address(settlement), BTCUSD, 50_000e8);
 
         vm.expectRevert(ChainlinkResolver.MarketNotExpired.selector);
-        resolver.resolve(mid);
+        // Any roundId — the call must revert at the endTime check first.
+        resolver.resolve(mid, 1);
     }
 
     function test_resolveUnregisteredReverts() public {
         vm.expectRevert(ChainlinkResolver.MarketNotRegistered.selector);
-        resolver.resolve(999_999);
+        resolver.resolve(999_999, 1);
     }
 
     function test_doubleResolveReverts() public {
@@ -115,11 +140,13 @@ contract UpDownForkTest is Test {
         uint256 mid = settlement.createMarket(BTCUSD, 300, 50_000e8);
         resolver.registerMarket(mid, address(settlement), BTCUSD, 50_000e8);
 
+        uint256 endTime = uint256(settlement.getMarket(mid).endTime);
         vm.warp(block.timestamp + 400);
-        resolver.resolve(mid);
+        uint80 canonical = _findCanonicalRound(CHAINLINK_BTC_USD, endTime);
+        resolver.resolve(mid, canonical);
 
         vm.expectRevert(ChainlinkResolver.AlreadyResolved.selector);
-        resolver.resolve(mid);
+        resolver.resolve(mid, canonical);
     }
 
     function test_resolveUpWins() public {
@@ -130,8 +157,10 @@ contract UpDownForkTest is Test {
         uint256 mid = settlement.createMarket(BTCUSD, 300, strike);
         resolver.registerMarket(mid, address(settlement), BTCUSD, strike);
 
+        uint256 endTime = uint256(settlement.getMarket(mid).endTime);
         vm.warp(block.timestamp + 400);
-        resolver.resolve(mid);
+        uint80 canonical = _findCanonicalRound(CHAINLINK_BTC_USD, endTime);
+        resolver.resolve(mid, canonical);
 
         assertEq(settlement.getMarket(mid).winner, resolver.OPTION_UP(), "UP should win when price > strike");
     }
@@ -144,8 +173,10 @@ contract UpDownForkTest is Test {
         uint256 mid = settlement.createMarket(BTCUSD, 300, strike);
         resolver.registerMarket(mid, address(settlement), BTCUSD, strike);
 
+        uint256 endTime = uint256(settlement.getMarket(mid).endTime);
         vm.warp(block.timestamp + 400);
-        resolver.resolve(mid);
+        uint80 canonical = _findCanonicalRound(CHAINLINK_BTC_USD, endTime);
+        resolver.resolve(mid, canonical);
 
         assertEq(settlement.getMarket(mid).winner, resolver.OPTION_DOWN(), "DOWN should win when price <= strike");
     }
@@ -223,8 +254,10 @@ contract UpDownForkTest is Test {
         uint256 mid = settlement.createMarket(BTCUSD, 300, 1);
         resolver.registerMarket(mid, address(settlement), BTCUSD, 1);
 
+        uint256 endTime = uint256(settlement.getMarket(mid).endTime);
         vm.warp(block.timestamp + 400);
-        resolver.resolve(mid);
+        uint80 canonical = _findCanonicalRound(CHAINLINK_BTC_USD, endTime);
+        resolver.resolve(mid, canonical);
         assertTrue(settlement.getMarket(mid).resolved);
     }
 }

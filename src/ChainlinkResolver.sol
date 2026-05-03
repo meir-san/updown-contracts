@@ -21,6 +21,17 @@ contract ChainlinkResolver is Ownable {
     error AlreadyResolved();
     error TrustedSettlementMismatch();
     error ZeroTrustedSettlement();
+    /// @notice PR-10 (P0-16): the supplied `roundId`'s `updatedAt` is AFTER
+    ///         `market.endTime` — i.e. the caller picked a round that postdates
+    ///         the market window. The canonical round for this market is the
+    ///         latest round whose `updatedAt <= endTime`.
+    error RoundTooLate();
+    /// @notice PR-10 (P0-16): the supplied `roundId` is valid (`updatedAt <=
+    ///         endTime`) but the *next* round's `updatedAt` is also `<=
+    ///         endTime` — meaning the caller picked an earlier round, not the
+    ///         last one before endTime. Forces the resolution price to the
+    ///         single deterministic round per market.
+    error NotLastPreEndTimeRound();
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
@@ -112,8 +123,22 @@ contract ChainlinkResolver is Ownable {
         return _getLatestPrice(pairId);
     }
 
-    // ── Public: permissionless resolution ────────────────────────────────
-    function resolve(uint256 marketId) external {
+    // ── Public: permissionless roundId-bound resolution ─────────────────
+    /// @notice Resolve `marketId` using the Chainlink round identified by
+    ///         `roundId`. The contract verifies `roundId` is the *canonical*
+    ///         round for the market — i.e. the latest round whose `updatedAt`
+    ///         is `<= market.endTime`, with the next round strictly after.
+    ///         This is permissionless: anyone can call, but only the canonical
+    ///         `roundId` will succeed, eliminating the race-to-resolve attack
+    ///         that existed under the old `latestRoundData` semantics.
+    /// @dev    PR-10 (P0-16). Off-chain helpers (see backend
+    ///         `ChainlinkResolverService`) compute the canonical round and
+    ///         submit it; on-chain we re-derive the constraints rather than
+    ///         trust the caller. `_isStale(updatedAt)` (via MAX_STALENESS) is
+    ///         still applied so a feed gap that places the canonical round far
+    ///         in the past clamps rather than silently resolves on an ancient
+    ///         price.
+    function resolve(uint256 marketId, uint80 roundId) external {
         MarketInfo storage info = markets[marketId];
         if (info.settlement == address(0)) revert MarketNotRegistered();
         if (info.resolved) revert AlreadyResolved();
@@ -122,7 +147,30 @@ contract ChainlinkResolver is Ownable {
         if (block.timestamp < uint256(m.endTime)) revert MarketNotExpired();
 
         _checkSequencer();
-        int256 settlementPrice = _getLatestPrice(info.pairId);
+
+        // ── Roundtrip: pull the supplied round and the next round, verify
+        //    canonicality, then use the supplied round's `answer` as the
+        //    settlement price. ───────────────────────────────────────────
+        address feed = priceFeeds[info.pairId];
+        if (feed == address(0)) revert FeedNotConfigured();
+
+        AggregatorV3Interface aggregator = AggregatorV3Interface(feed);
+
+        (, int256 settlementPrice,, uint256 updatedAt,) = aggregator.getRoundData(roundId);
+        if (updatedAt > uint256(m.endTime)) revert RoundTooLate();
+
+        // Existing MAX_STALENESS guard — still meaningful because the
+        // *canonical* round can itself be ancient if the feed is gapped
+        // (e.g. the resolver runs days after endTime on a stalled feed).
+        if (block.timestamp - updatedAt > MAX_STALENESS) revert StalePrice();
+
+        // The next round MUST postdate endTime — proves the caller picked
+        // the LAST pre-endTime round, not just any earlier one. If the
+        // round is missing (some Chainlink feeds may revert for unknown
+        // ids) `getRoundData` reverts and the call fails closed, which
+        // is the safe default.
+        (, , , uint256 nextUpdatedAt,) = aggregator.getRoundData(roundId + 1);
+        if (nextUpdatedAt <= uint256(m.endTime)) revert NotLastPreEndTimeRound();
 
         uint256 winningOption = settlementPrice > info.strikePrice ? OPTION_UP : OPTION_DOWN;
 

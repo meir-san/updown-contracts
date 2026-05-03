@@ -152,17 +152,21 @@ contract UpDownAutoCycler is Ownable {
     }
 
     /// @notice Called on-chain by Chainlink Automation when checkUpkeep returns true.
+    /// @dev    PR-10 (P0-16): on-chain resolve dispatch was REMOVED here. The
+    ///         resolver now requires `(marketId, uint80 roundId)` — the
+    ///         canonical Chainlink round whose `updatedAt <= market.endTime`,
+    ///         which only an off-chain helper can compute by scanning the
+    ///         feed's round history. Backend `ChainlinkResolverService` owns
+    ///         this responsibility now; Chainlink Automation only drives
+    ///         creation + pruning. `resolveIndices` is preserved in
+    ///         `performData` (still emitted by `checkUpkeep`) so a future
+    ///         redesign can read it, but `performUpkeep` ignores it today.
     function performUpkeep(bytes calldata performData) external {
-        (uint256[] memory resolveIndices, CreateSlot[] memory createSlots) =
+        // `resolveIndices` is decoded for ABI/payload stability with the
+        // Chainlink Automation registration but not iterated here because
+        // resolution is roundId-bound and lives off-chain.
+        (, CreateSlot[] memory createSlots) =
             abi.decode(performData, (uint256[], CreateSlot[]));
-
-        // Phase A: resolve expired markets
-        for (uint256 i; i < resolveIndices.length; ++i) {
-            uint256 marketId = _activeMarkets[resolveIndices[i]].marketId;
-            try resolver.resolve(marketId) {} catch (bytes memory reason) {
-                emit ResolutionFailed(marketId, reason);
-            }
-        }
 
         // Phase B: create new markets (external self-call so try/catch can recover)
         for (uint256 i; i < createSlots.length; ++i) {
