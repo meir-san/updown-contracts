@@ -41,6 +41,9 @@ contract UpDownSettlement is Ownable, EIP712 {
     error InvalidSide();
     error MarketMismatch();
     error OptionMismatch();
+    // PR-5-bundle (P0-7 + P0-13 + P0-17): atomic settlement
+    error FeeBreakdownInvalid();
+    error TreasuryNotConfigured();
 
     // ── Types ───────────────────────────────────────────────────────────
     /// @dev Packed for cheaper `createMarket` (fewer cold storage slots on first write).
@@ -104,6 +107,21 @@ contract UpDownSettlement is Ownable, EIP712 {
     event EmergencyWithdrawProposed(address indexed token, address indexed to, uint256 amount, uint256 unlocksAt);
     event EmergencyWithdrawExecuted(address indexed token, address indexed to, uint256 amount);
     event EmergencyWithdrawCancelled(bytes32 indexed proposalId);
+    /// @notice PR-5-bundle (P0-7 + P0-13 + P0-17): emitted on every atomic
+    ///         fill. Carries every transfer destination so off-chain
+    ///         indexers see the entire settlement flow without joining
+    ///         to ERC20 Transfer logs.
+    event FillSettled(
+        bytes32 indexed orderHash,
+        address indexed buyer,
+        address indexed seller,
+        uint256 fillAmount,
+        uint256 sellerReceives,
+        uint256 platformFee,
+        uint256 makerFee,
+        address makerFeeRecipient
+    );
+    event TreasurySet(address indexed previous, address indexed current);
 
     // ── Immutables / roles ─────────────────────────────────────────────
     IERC20 public immutable usdt;
@@ -111,6 +129,14 @@ contract UpDownSettlement is Ownable, EIP712 {
     address public resolver;
     address public autocycler;
     address public relayer;
+    /// @notice PR-5-bundle (P0-7): destination for `platformFee` paid out
+    ///         atomically inside `enterPosition`. Configurable by owner.
+    ///         Pre-fix fees accumulated in the contract via
+    ///         `totalAccumulatedFees`; under atomic settlement they leave
+    ///         the contract immediately so off-chain dashboards can see
+    ///         them via `usdt.balanceOf(treasury)` rather than a Mongo
+    ///         row that has no API surface.
+    address public treasury;
 
     uint256 public nextMarketId;
     mapping(uint256 => Market) public markets;
@@ -258,58 +284,127 @@ contract UpDownSettlement is Ownable, EIP712 {
     /// @param option     Must equal `order.option`. Same reason as `marketId`.
     /// @param fillAmount Amount to enter for this call. May be less than `order.amount`
     ///                   (partial fill); subsequent calls with same signature may top up.
-    function enterPosition(
-        Order calldata order,
-        bytes calldata signature,
-        uint256 marketId,
-        uint8 option,
-        uint256 fillAmount
-    ) external whenNotPaused {
+    /// @notice PR-5-bundle (P0-7 + P0-13 + P0-17) inputs. Backed by a
+    ///         struct rather than positional args so future fields don't
+    ///         break ABI consumers and so calldata is laid out
+    ///         predictably.
+    struct FillInputs {
+        Order order;          // signed by maker (= seller for SELL maker, buyer for BUY maker)
+        bytes signature;      // maker's EIP-712 sig over Order
+        uint256 marketId;     // explicit redundant copy of order.market for arg/sig pinning
+        uint8 option;         // explicit redundant copy of order.option
+        uint256 fillAmount;   // amount being filled now (not the signed total)
+        address taker;        // counterparty wallet (the OTHER side of the maker)
+        uint256 sellerReceives;    // pre-computed by relayer using same fee math as the engine
+        uint256 platformFee;       // pre-computed; sent to `treasury`
+        uint256 makerFee;          // pre-computed; sent to `makerFeeRecipient`
+        address makerFeeRecipient; // typically = order.maker (the resting side)
+    }
+
+    /// @notice PR-5-bundle (P0-7 + P0-13 + P0-17): atomic settlement entry
+    ///         point. Pulls `fillAmount` from the buyer and atomically pays
+    ///         the seller, treasury, and maker in the same tx — closes the
+    ///         off-chain BalanceModel ledger gap (P0-7), the relayer-only
+    ///         guard prevents anyone with a leaked signed order from
+    ///         filling it post-cancel (P0-13), and maker rebates flow to
+    ///         every maker (not just DMMs — closes P0-17).
+    /// @dev    `f.sellerReceives + f.platformFee + f.makerFee` must be
+    ///         `<= f.fillAmount` (the contract retains the remainder for
+    ///         at-resolution backing of the buyer's position). The
+    ///         relayer is trusted to compute these from the off-chain fee
+    ///         schedule; the on-chain check is defense-in-depth against
+    ///         off-by-one or malicious relayer.
+    function enterPosition(FillInputs calldata f) external whenNotPaused onlyRelayer {
         // Arg/order consistency (prevents calldata from asking for one market while sig
         // was for another, even though sig itself ties those fields).
-        if (marketId != order.market) revert MarketMismatch();
-        if (uint256(option) != order.option) revert OptionMismatch();
+        if (f.marketId != f.order.market) revert MarketMismatch();
+        if (uint256(f.option) != f.order.option) revert OptionMismatch();
 
-        if (block.timestamp > order.expiry) revert OrderExpired();
-        if (order.option != 1 && order.option != 2) revert InvalidOption();
-        if (order.side != 0) revert InvalidSide(); // 0 = BUY; sellers settled off-chain
-        if (fillAmount == 0) revert FillExceedsOrderAmount();
+        if (block.timestamp > f.order.expiry) revert OrderExpired();
+        if (f.order.option != 1 && f.order.option != 2) revert InvalidOption();
+        if (f.order.side != 0 && f.order.side != 1) revert InvalidSide();
+        if (f.fillAmount == 0) revert FillExceedsOrderAmount();
+
+        // PR-5-bundle: defense-in-depth fee-breakdown check. Relayer is
+        // already gated by onlyRelayer, but a single accidental off-by-one
+        // here drains the contract — cheap to verify before transferring.
+        if (f.sellerReceives + f.platformFee + f.makerFee > f.fillAmount) {
+            revert FeeBreakdownInvalid();
+        }
+        if (f.platformFee > 0 && treasury == address(0)) revert TreasuryNotConfigured();
 
         // Verify maker's EIP-712 signature over the Order. SignatureChecker
         // handles BOTH plain EOAs (via ECDSA.recover internally) AND contract
-        // accounts that implement ERC-1271 (e.g. Alchemy MA v2 smart accounts:
-        // order.maker IS the SA address; the SA's `isValidSignature` delegates
-        // to its EOA owner). Required because user USDT lives on the SA, so
-        // `transferFrom(order.maker, ...)` below pulls from the SA — meaning
-        // `maker` must be the SA. EOA-only `ECDSA.recover` would never accept
-        // an SA as the recovered address. This is the prediction-market-
-        // standard pattern (Polymarket, etc.).
-        bytes32 structHash = hashOrder(order);
+        // accounts that implement ERC-1271. Path-1 today has order.maker == EOA;
+        // ERC-1271 path retained so a future SA-as-maker upgrade is a config
+        // change, not a contract one.
+        bytes32 structHash = hashOrder(f.order);
         bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(order.maker, digest, signature)) {
+        if (!SignatureChecker.isValidSignatureNow(f.order.maker, digest, f.signature)) {
             revert InvalidSignature();
         }
 
         // Partial-fill bookkeeping: cumulative filled must not exceed signed amount.
         uint256 already = orderFills[structHash];
-        uint256 newFilled = already + fillAmount;
-        if (newFilled > order.amount) revert FillExceedsOrderAmount();
+        uint256 newFilled = already + f.fillAmount;
+        if (newFilled > f.order.amount) revert FillExceedsOrderAmount();
         orderFills[structHash] = newFilled;
 
         // Market must be active.
-        Market storage m = markets[marketId];
+        Market storage m = markets[f.marketId];
         if (m.startTime == 0) revert MarketNotOpen();
         if (block.timestamp >= uint256(m.endTime)) revert MarketNotOpen();
 
-        // Pull USDT from maker's account. Maker must have approved this contract.
-        usdt.safeTransferFrom(order.maker, address(this), fillAmount);
-
-        if (order.option == 1) {
-            m.totalUp += uint128(fillAmount);
+        // Identify buyer / seller. `taker` is the counterparty to the
+        // maker; the BUYER is whichever side has order.side == BUY.
+        address buyer;
+        address seller;
+        if (f.order.side == 0) {
+            buyer = f.order.maker;
+            seller = f.taker;
         } else {
-            m.totalDown += uint128(fillAmount);
+            buyer = f.taker;
+            seller = f.order.maker;
         }
-        emit PositionEntered(marketId, uint8(order.option), fillAmount, order.maker);
+
+        // Pull buyer's collateral. Buyer must have approved this contract.
+        usdt.safeTransferFrom(buyer, address(this), f.fillAmount);
+
+        // Atomic outflows. Seller may be address(0) for genuine first-issuance
+        // legs that have no counterparty (e.g. DMM bootstrap); seller == 0
+        // skips the seller payout but still pays fees.
+        if (seller != address(0) && f.sellerReceives > 0) {
+            usdt.safeTransfer(seller, f.sellerReceives);
+        }
+        if (f.platformFee > 0) {
+            usdt.safeTransfer(treasury, f.platformFee);
+        }
+        if (f.makerFee > 0 && f.makerFeeRecipient != address(0)) {
+            usdt.safeTransfer(f.makerFeeRecipient, f.makerFee);
+        }
+
+        // Pool tracking — `m.totalUp` / `m.totalDown` retained as ANALYTICS
+        // ONLY post-bundle. The actual at-resolution payout flow is
+        // off-chain Position.netShares × winnerPayoutPerShare per Meir's
+        // 2026-05-03 design call. Drop the storage in a future cleanup
+        // once the off-chain flow has stabilized.
+        if (f.order.option == 1) {
+            m.totalUp += uint128(f.fillAmount);
+        } else {
+            m.totalDown += uint128(f.fillAmount);
+        }
+
+        emit PositionEntered(f.marketId, uint8(f.order.option), f.fillAmount, f.order.maker);
+        emit FillSettled(
+            structHash,
+            buyer,
+            seller,
+            f.fillAmount,
+            f.sellerReceives,
+            f.platformFee,
+            f.makerFee,
+            f.makerFeeRecipient
+        );
     }
 
     function resolve(uint256 marketId, int256 settlementPrice, uint8 winner) external onlyResolver whenNotPaused {
@@ -412,6 +507,16 @@ contract UpDownSettlement is Ownable, EIP712 {
     function setRelayer(address a) external onlyOwner {
         if (a == address(0)) revert ZeroAddress();
         relayer = a;
+    }
+
+    /// @notice PR-5-bundle (P0-7): set the treasury EOA. `enterPosition`
+    ///         now sends `platformFee` here directly per fill instead of
+    ///         accumulating in `totalAccumulatedFees`.
+    function setTreasury(address a) external onlyOwner {
+        if (a == address(0)) revert ZeroAddress();
+        address prev = treasury;
+        treasury = a;
+        emit TreasurySet(prev, a);
     }
 
     function setFees(uint256 platformBps, uint256 makerBps) external onlyOwner {
