@@ -36,10 +36,14 @@ contract DeployUpDown is Script {
         address deployer = vm.addr(deployerKey);
         address usdt = vm.envAddress("USDT_ADDRESS");
         address relayer = vm.envAddress("RELAYER_ADDRESS");
+        // PR-5-bundle (P0-7): treasury must be configured pre-broadcast or
+        // any fill with platformFee > 0 reverts on TreasuryNotConfigured.
+        address treasury = vm.envAddress("TREASURY_ADDRESS");
 
         console.log("Deployer:", deployer);
         console.log("USDT:", usdt);
         console.log("Relayer:", relayer);
+        console.log("Treasury:", treasury);
 
         vm.startBroadcast(deployerKey);
 
@@ -58,8 +62,17 @@ contract DeployUpDown is Script {
         settlement.setResolver(address(resolver));
         settlement.setAutocycler(address(cycler));
         settlement.setRelayer(relayer);
+        // PR-5-bundle: wire treasury so atomic platformFee transfers land
+        // on the right EOA from the very first fill.
+        settlement.setTreasury(treasury);
 
         resolver.setAuthorizedCaller(address(cycler), true);
+
+        // Whitelist + start cycling both pairs so AutoCycler creates markets
+        // for the repros immediately (the prior dev deployment did this in a
+        // separate one-off tx; folded in here).
+        cycler.addPair(BTCUSD);
+        cycler.addPair(ETHUSD);
 
         vm.stopBroadcast();
 
