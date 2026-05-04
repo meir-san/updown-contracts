@@ -16,6 +16,7 @@ contract UpDownAutoCycler is Ownable {
 
     // ── Errors ──────────────────────────────────────────────────────────
     error InvalidTimeframeIndex();
+    error PreStartWindowTooLarge();
 
     // ── Events ──────────────────────────────────────────────────────────
     event MarketCreated(uint256 indexed marketId, bytes32 indexed pairId, uint256 duration, int256 strikePrice);
@@ -23,6 +24,10 @@ contract UpDownAutoCycler is Ownable {
     event ResolutionFailed(uint256 indexed marketId, bytes reason);
     event TimeframeToggled(uint256 indexed index, bool active);
     event FundsWithdrawn(address indexed token, uint256 amount);
+    /// @notice Emitted when the owner changes the pre-start window. Off-chain
+    ///         consumers (the backend's MarketSyncer) read this to know how
+    ///         far ahead of `startTime` markets may now appear.
+    event PreStartWindowUpdated(uint256 previous, uint256 current);
 
     // ── Types ───────────────────────────────────────────────────────────
     struct TimeframeConfig {
@@ -62,6 +67,25 @@ contract UpDownAutoCycler is Ownable {
 
     /// @notice Start timestamp of the last created slot (clock-aligned boundary) per (pairId, timeframeIndex).
     mapping(bytes32 => mapping(uint256 => uint256)) public pairTfLastCreated;
+
+    /// @notice Pre-positioning window — number of seconds BEFORE a slot's
+    ///         `startTime` at which `_createMarket` becomes eligible to
+    ///         create that slot's market. Default 0 = current behavior
+    ///         (markets are created at-or-after `startTime`, never early).
+    ///         When set to e.g. 30, the cycler creates a market with
+    ///         `startTime = next slot boundary` once `block.timestamp +
+    ///         preStartWindowSec >= nextSlotBoundary`. Backend matching
+    ///         engine refuses to match orders on a market whose
+    ///         `startTime` is in the future, so trades only land at-or-
+    ///         after the boundary; the pre-window exists only so makers
+    ///         can sign orders + post them to the engine before the
+    ///         continuous cross begins.
+    ///
+    ///         Capped at the smallest active timeframe duration (300s)
+    ///         so the next-slot market can't be created before the
+    ///         current slot's market is even live.
+    uint256 public preStartWindowSec;
+    uint256 public constant PRE_START_WINDOW_MAX = 300;
 
     // ── Constructor ─────────────────────────────────────────────────────
     constructor(address _owner, address _resolver, address _settlement) Ownable(_owner) {
@@ -103,8 +127,14 @@ contract UpDownAutoCycler is Ownable {
     // ── Chainlink Automation ────────────────────────────────────────────
 
     /// @notice Called off-chain by Chainlink Automation nodes every block.
+    /// @dev    PR-PrePos: market creation triggers `preStartWindowSec`
+    ///         seconds earlier than today; each slot's market is created
+    ///         when `block.timestamp + preStartWindowSec >= pairTfLastCreated
+    ///         + tf.duration`. Reduces to today's behavior (`>= pairTfLastCreated
+    ///         + tf.duration`) when `preStartWindowSec == 0`.
     function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory performData) {
         uint256 marketsLen = _activeMarkets.length;
+        uint256 preWin = preStartWindowSec;
 
         uint256 resolveCount;
         for (uint256 i; i < marketsLen; ++i) {
@@ -118,7 +148,7 @@ contract UpDownAutoCycler is Ownable {
             if (!supportedPairs[pid]) continue;
             for (uint256 ti; ti < NUM_TIMEFRAMES; ++ti) {
                 TimeframeConfig storage tft = timeframes[ti];
-                if (tft.active && block.timestamp >= pairTfLastCreated[pid][ti] + tft.duration) {
+                if (tft.active && block.timestamp + preWin >= pairTfLastCreated[pid][ti] + tft.duration) {
                     ++createCount;
                 }
             }
@@ -141,7 +171,7 @@ contract UpDownAutoCycler is Ownable {
                 if (!supportedPairs[pid]) continue;
                 for (uint256 ti; ti < NUM_TIMEFRAMES; ++ti) {
                     TimeframeConfig storage tft = timeframes[ti];
-                    if (tft.active && block.timestamp >= pairTfLastCreated[pid][ti] + tft.duration) {
+                    if (tft.active && block.timestamp + preWin >= pairTfLastCreated[pid][ti] + tft.duration) {
                         createSlots[ci++] = CreateSlot({pairId: pid, tfIdx: ti});
                     }
                 }
@@ -187,6 +217,17 @@ contract UpDownAutoCycler is Ownable {
 
     // ── Internal ────────────────────────────────────────────────────────
 
+    /// @dev PR-PrePos: planned start = `lastStart + tf.duration` so each
+    ///      cycle creates the slot AFTER the most recently created one.
+    ///      For the first-ever create on a (pair, tf), bootstrap to the
+    ///      current clock-aligned boundary (preserves today's bootstrap
+    ///      semantics). When `preStartWindowSec > 0`, `_createMarket` is
+    ///      reachable via `checkUpkeep` up to `preStartWindowSec` seconds
+    ///      before `plannedStart`, so the resulting market may have
+    ///      `startTime > block.timestamp` (= "pre-start" / "WAITING_TO_START"
+    ///      from the backend's perspective). The off-chain matching engine
+    ///      refuses to match orders on a market whose `startTime` is in
+    ///      the future, so trades only land at-or-after the boundary.
     function _createMarket(uint256 tfIdx, bytes32 pairId) internal {
         if (tfIdx >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
         if (!supportedPairs[pairId]) revert("pair not supported");
@@ -196,17 +237,22 @@ contract UpDownAutoCycler is Ownable {
         int256 strike = resolver.getPrice(pairId);
 
         uint256 nowTs = block.timestamp;
-        uint256 currentBoundary = (nowTs / tf.duration) * tf.duration;
-        uint256 nextBoundary = currentBoundary + tf.duration;
+        uint256 lastStart = pairTfLastCreated[pairId][tfIdx];
+        uint256 plannedStart;
+        if (lastStart == 0) {
+            // First create on this (pair, tf): align to the current boundary.
+            plannedStart = (nowTs / tf.duration) * tf.duration;
+        } else {
+            // Continuing cycle: next slot follows the previous one exactly.
+            plannedStart = lastStart + tf.duration;
+        }
+        uint256 end = plannedStart + tf.duration;
 
-        uint256 start = currentBoundary;
-        uint256 end = nextBoundary;
-
-        uint256 marketId = settlement.createMarket(pairId, tf.duration, strike, uint64(start), uint64(end));
+        uint256 marketId = settlement.createMarket(pairId, tf.duration, strike, uint64(plannedStart), uint64(end));
 
         resolver.registerMarket(marketId, address(settlement), pairId, strike);
         _activeMarkets.push(ActiveMarket({marketId: marketId, endTime: end, pairId: pairId}));
-        pairTfLastCreated[pairId][tfIdx] = currentBoundary;
+        pairTfLastCreated[pairId][tfIdx] = plannedStart;
 
         emit MarketCreated(marketId, pairId, tf.duration, strike);
     }
@@ -217,6 +263,19 @@ contract UpDownAutoCycler is Ownable {
         if (index >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
         timeframes[index].active = active;
         emit TimeframeToggled(index, active);
+    }
+
+    /// @notice Set the pre-positioning window (seconds before `startTime`
+    ///         at which a slot's market becomes eligible to be created).
+    ///         0 disables pre-positioning (default; matches pre-PR behavior).
+    ///         Capped at `PRE_START_WINDOW_MAX` (= the smallest active
+    ///         timeframe duration, 300s) so the next-slot market can't
+    ///         appear before the current slot's market is even live.
+    function setPreStartWindowSec(uint256 v) external onlyOwner {
+        if (v > PRE_START_WINDOW_MAX) revert PreStartWindowTooLarge();
+        uint256 prev = preStartWindowSec;
+        preStartWindowSec = v;
+        emit PreStartWindowUpdated(prev, v);
     }
 
     /// @notice Whitelist a pair and include it in automated cycling (idempotent for cycling list).

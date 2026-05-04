@@ -253,7 +253,7 @@ contract UpDownUnit is Test {
         assertEq(settlement.getMarket(mid).winner, 1, "70k > 50k strike => UP");
     }
 
-    /// @notice Wrong roundId: round AFTER endTime → reverts RoundTooLate.
+    /// @notice Wrong roundId: round AFTER endTime -> reverts RoundTooLate.
     ///         This is the core race-to-resolve attack: a caller submits a
     ///         roundId that postdates endTime to bias the price in their
     ///         favour. The contract must reject regardless of `block.timestamp`.
@@ -474,6 +474,113 @@ contract UpDownUnit is Test {
         uint256 boundary = (ts / 300) * 300;
         assertEq(cycler.pairTfLastCreated(BTCUSD, 0), boundary);
         assertTrue(cycler.pairTfLastCreated(BTCUSD, 0) != ts);
+    }
+
+    // ── PR-PrePos: pre-positioning window ──────────────────────────────
+
+    function test_prePositioning_disabledByDefault() public {
+        (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
+        assertEq(cycler.preStartWindowSec(), 0, "default = pre-positioning off");
+    }
+
+    function test_prePositioning_setterEnforcesCap() public {
+        (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
+        cycler.setPreStartWindowSec(0);
+        cycler.setPreStartWindowSec(30);
+        cycler.setPreStartWindowSec(300);
+        vm.expectRevert(UpDownAutoCycler.PreStartWindowTooLarge.selector);
+        cycler.setPreStartWindowSec(301);
+    }
+
+    function test_prePositioning_setterEmitsEvent() public {
+        (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
+        vm.expectEmit(false, false, false, true);
+        emit UpDownAutoCycler.PreStartWindowUpdated(0, 30);
+        cycler.setPreStartWindowSec(30);
+        vm.expectEmit(false, false, false, true);
+        emit UpDownAutoCycler.PreStartWindowUpdated(30, 60);
+        cycler.setPreStartWindowSec(60);
+    }
+
+    function test_prePositioning_secondCreate_yieldsConsecutiveSlots() public {
+        // PR-PrePos changed `_createMarket` to plan from `lastStart + duration`
+        // instead of always re-aligning to `currentBoundary`. Verify the second
+        // create lands on the next slot, even if `block.timestamp` has skipped
+        // forward across multiple boundaries.
+        uint256 ts = 1_234_567_890;
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
+
+        cycler.harnessCreateMarket(0, BTCUSD);
+        UpDownSettlement.Market memory m1 = settlement.getMarket(1);
+        uint256 firstStart = uint256(m1.startTime);
+
+        // Advance into the next slot (300s later) and create again.
+        vm.warp(firstStart + 350);
+        cycler.harnessCreateMarket(0, BTCUSD);
+        UpDownSettlement.Market memory m2 = settlement.getMarket(2);
+
+        // Plain consecutive slot — start = previous start + duration.
+        assertEq(uint256(m2.startTime), firstStart + 300, "second slot starts where first ends");
+        assertEq(uint256(m2.endTime), firstStart + 600);
+    }
+
+    function test_prePositioning_marketStartsInFutureWhenWindowOpen() public {
+        // With preStartWindowSec = 30, advancing to 30s before the boundary
+        // and harness-creating must yield a market whose startTime is in the
+        // future (the next boundary) — proving pre-positioning is wired.
+        uint256 ts = 1_234_567_890;
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
+
+        cycler.setPreStartWindowSec(30);
+
+        // First market lands at the current boundary (bootstrap).
+        cycler.harnessCreateMarket(0, BTCUSD);
+        UpDownSettlement.Market memory m1 = settlement.getMarket(1);
+        uint256 firstStart = uint256(m1.startTime);
+        uint256 nextBoundary = firstStart + 300;
+
+        // Warp to 25s before the next boundary — inside the pre-window.
+        vm.warp(nextBoundary - 25);
+        cycler.harnessCreateMarket(0, BTCUSD);
+        UpDownSettlement.Market memory m2 = settlement.getMarket(2);
+
+        // The new market's startTime is in the FUTURE relative to now.
+        assertGt(uint256(m2.startTime), block.timestamp, "pre-start: startTime > now");
+        assertEq(uint256(m2.startTime), nextBoundary, "= next slot boundary");
+        assertEq(uint256(m2.endTime), nextBoundary + 300);
+    }
+
+    function test_prePositioning_checkUpkeep_firesEarly() public {
+        // checkUpkeep must signal "createNeeded" `preStartWindowSec` seconds
+        // earlier than the slot boundary. Pre-fix it required `block.timestamp
+        // >= lastStart + duration`; post-fix it only requires `+preStartWindow`.
+        uint256 ts = 1_234_567_890;
+        vm.warp(ts);
+        (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
+
+        // Bootstrap one market so `pairTfLastCreated[BTCUSD][0] = boundary`.
+        cycler.harnessCreateMarket(0, BTCUSD);
+        uint256 boundary = (ts / 300) * 300;
+        uint256 nextBoundary = boundary + 300;
+
+        cycler.setPreStartWindowSec(30);
+
+        // 31s before next boundary — pre-window NOT yet open.
+        vm.warp(nextBoundary - 31);
+        (bool needed,) = cycler.checkUpkeep("");
+        // Some prior runs may already have create eligibility for OTHER tfs
+        // (15m / 60m). To isolate the 5m signal, deactivate 15m + 60m.
+        cycler.toggleTimeframe(1, false);
+        cycler.toggleTimeframe(2, false);
+        (needed,) = cycler.checkUpkeep("");
+        assertFalse(needed, "31s before next boundary, preWin=30 -> not yet eligible");
+
+        // 30s before next boundary — pre-window now open.
+        vm.warp(nextBoundary - 30);
+        (needed,) = cycler.checkUpkeep("");
+        assertTrue(needed, "exactly preWin seconds before boundary -> eligible");
     }
 }
 
