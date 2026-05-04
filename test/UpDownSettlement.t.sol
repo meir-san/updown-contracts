@@ -494,6 +494,15 @@ contract UpDownSettlementTest is Test {
         assertEq(s.getMarket(mid).winner, 2);
     }
 
+    /// PR-Gap-bundle: `withdrawSettlement` now hands the relayer exactly
+    /// `marketRetained[mid]` (collateral that the contract actually holds)
+    /// rather than the pre-fix parimutuel `totalPool × (1 − feeBps/10000)`
+    /// figure that had no relationship to formula (c) outflows.
+    /// `_fill` here passes sellerReceives=platformFee=makerFee=0, so the
+    /// contract retains the entire fillAmount per fill — the relayer
+    /// receives 2000e18 and `totalAccumulatedFees` stays at 0 (fees never
+    /// accumulate in-contract under formula (c) — they leave atomically
+    /// inside `enterPosition`).
     function test_withdrawSettlementFees() public {
         vm.prank(autocycler);
         uint256 mid = s.createMarket(PAIR, 300, 1e18);
@@ -506,15 +515,17 @@ contract UpDownSettlementTest is Test {
         s.resolve(mid, 2e18, 1);
 
         uint256 relBefore = usdt.balanceOf(relayer);
+        // Pre-withdraw, the contract holds the per-market retained.
+        assertEq(s.marketRetained(mid), 2000e18);
+
         vm.prank(relayer);
         s.withdrawSettlement(mid);
 
-        uint256 totalPool = 2000e18;
-        uint256 expectedFees = (totalPool * 150) / 10_000;
-        uint256 expectedNet = totalPool - expectedFees;
-
-        assertEq(usdt.balanceOf(relayer), relBefore + expectedNet);
-        assertEq(s.totalAccumulatedFees(), expectedFees);
+        // Post-withdraw: relayer holds the full retained, on-chain
+        // bookkeeping is cleared, fee counter unchanged.
+        assertEq(usdt.balanceOf(relayer), relBefore + 2000e18);
+        assertEq(s.marketRetained(mid), 0);
+        assertEq(s.totalAccumulatedFees(), 0);
 
         UpDownSettlement.Market memory m = s.getMarket(mid);
         assertTrue(m.settled);
@@ -559,13 +570,19 @@ contract UpDownSettlementTest is Test {
         assertEq(s.dmmCount(), 0);
     }
 
-    function test_rebateAccumulateAndClaim() public {
+    /// PR-Gap-bundle reframe (was: test_rebateAccumulateAndClaim happy path):
+    /// under formula (c), `totalAccumulatedFees` is intentionally never
+    /// incremented — fees leave the contract atomically inside
+    /// `enterPosition` (to `treasury` and `makerFeeRecipient`). The
+    /// pre-bundle DMM rebate path that drew from the in-contract fee
+    /// bucket is therefore unreachable until a follow-up rebuilds it
+    /// against `treasury` rather than the contract. This test now pins
+    /// the new invariant: even after a fully settled market, accumulating
+    /// any non-zero rebate reverts.
+    function test_postGap_dmmRebatePathUnreachable() public {
         address dmm = address(0xd00);
         s.addDMM(dmm);
 
-        // PR-16 (P1-15): rebate funding now sources from accumulated fees
-        // rather than pulling from the relayer's external wallet. Run a
-        // settlement first so totalAccumulatedFees > 0, then accumulate.
         vm.prank(autocycler);
         uint256 mid = s.createMarket(PAIR, 300, 1e18);
         _fill(mid, 1, 1000e18, 60);
@@ -575,20 +592,19 @@ contract UpDownSettlementTest is Test {
         s.resolve(mid, 2e18, 1);
         vm.prank(relayer);
         s.withdrawSettlement(mid);
-        uint256 feesBefore = s.totalAccumulatedFees();
-        require(feesBefore >= 5e18, "fixture: fees too small");
+
+        // Post-settlement, the fee counter must still be zero — fees are
+        // not in-contract under formula (c).
+        assertEq(s.totalAccumulatedFees(), 0);
 
         vm.prank(relayer);
-        s.accumulateRebate(dmm, 5e18);
+        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
+        s.accumulateRebate(dmm, 1);
 
-        assertEq(s.dmmRebateAccumulated(dmm), 5e18);
-        assertEq(s.totalAccumulatedFees(), feesBefore - 5e18);
-
-        vm.prank(dmm);
-        s.claimRebate();
-
+        // DMM never received anything — rebate funding mechanism is
+        // intentionally disabled until the follow-up.
         assertEq(s.dmmRebateAccumulated(dmm), 0);
-        assertEq(usdt.balanceOf(dmm), 5e18);
+        assertEq(usdt.balanceOf(dmm), 0);
     }
 
     function test_fullCycle() public {
@@ -638,18 +654,15 @@ contract UpDownSettlementTest is Test {
 
     // ── PR-16 (P1-15 + P1-16 + P1-17 + P1-18) ─────────────────────────
 
-    /// @dev Helper: settle one market so the contract has a non-zero
-    ///      totalAccumulatedFees + matching USDT balance to draw from.
+    /// @dev Helper: leave the contract holding some USDT so withdraw-fee /
+    ///      emergency-withdraw tests have something to draw from. Pre
+    ///      PR-Gap-bundle this seeded `totalAccumulatedFees` via the
+    ///      pre-fix `withdrawSettlement` path; under formula (c) that
+    ///      path no longer increments the counter, so we mint USDT
+    ///      directly into the contract instead. The fees counter
+    ///      stays at 0, which is the correct post-fix invariant.
     function _settleOneMarketForFees() internal returns (uint256 feesAfter) {
-        vm.prank(autocycler);
-        uint256 mid = s.createMarket(PAIR, 300, 1e18);
-        _fill(mid, 1, 1000e18, 70);
-        _fill(mid, 2, 1000e18, 71);
-        vm.warp(block.timestamp + 301);
-        vm.prank(resolver);
-        s.resolve(mid, 2e18, 1);
-        vm.prank(relayer);
-        s.withdrawSettlement(mid);
+        usdt.mint(address(s), 100e18);
         return s.totalAccumulatedFees();
     }
 
@@ -662,18 +675,20 @@ contract UpDownSettlementTest is Test {
         s.accumulateRebate(dmm, 1);
     }
 
-    function test_pr16_accumulateRebate_decrementsAccumulator() public {
+    /// PR-Gap-bundle reframe: the pre-fix decrement-on-rebate path is
+    /// unreachable under formula (c). The single-revert `…revertsWhenAmount
+    /// ExceedsFees` test above is now the canonical assertion that
+    /// rebate accumulation is gated on a counter that's always zero.
+    /// This test is preserved as a marker for the follow-up that should
+    /// rebuild rebates against `treasury` rather than the contract.
+    function test_postGap_rebateDecrementMechanismIsDisabled() public {
         address dmm = address(0xd00);
         s.addDMM(dmm);
-        uint256 fees = _settleOneMarketForFees();
-        require(fees >= 1e18, "fixture: need >= 1 USDT in fees");
-        uint256 before = s.totalAccumulatedFees();
-
+        // No path increments totalAccumulatedFees under formula (c).
+        assertEq(s.totalAccumulatedFees(), 0);
         vm.prank(relayer);
-        s.accumulateRebate(dmm, 1e18);
-
-        assertEq(s.totalAccumulatedFees(), before - 1e18);
-        assertEq(s.dmmRebateAccumulated(dmm), 1e18);
+        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
+        s.accumulateRebate(dmm, 1);
     }
 
     function test_pr16_withdrawFees_revertsWhenAmountExceedsAccumulator() public {

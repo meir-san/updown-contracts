@@ -156,6 +156,20 @@ contract UpDownSettlement is Ownable, EIP712 {
     ///         prevent over-fill; replays that would push total past the signed max revert.
     mapping(bytes32 => uint256) public orderFills;
 
+    /// @notice Per-market retained collateral (PR-Gap-bundle, supersedes pre-bundle
+    ///         parimutuel `(totalPool × (1 − feeBps/10000))` math in `withdrawSettlement`).
+    ///         Under formula (c) atomic settlement the contract retains exactly
+    ///         `fillAmount − sellerReceives − platformFee − makerFee` per fill; that's
+    ///         the only money the contract holds for this market and it's the only
+    ///         money `withdrawSettlement` should hand to the relayer at resolution.
+    ///
+    ///         Pre-fix, `withdrawSettlement` recomputed `totalPool × (1 − feeBps/10000)`
+    ///         from `m.totalUp + m.totalDown` — a number that has no relationship to the
+    ///         actual residual under price-aware atomic settlement. The relayer was
+    ///         either short-paid (drained its own USDT to cover winners) or over-paid
+    ///         (drained backing of unrelated open markets).
+    mapping(uint256 => uint256) public marketRetained;
+
     // ── PR-16 (P1-17) emergency-withdraw timelock ─────────────────────
     /// @notice 24h delay between proposing and executing an emergency withdraw.
     uint256 public constant EMERGENCY_TIMELOCK = 24 hours;
@@ -394,6 +408,15 @@ contract UpDownSettlement is Ownable, EIP712 {
             m.totalDown += uint128(f.fillAmount);
         }
 
+        // Per-market retained = collateral pulled in − atomic outflows.
+        // Backed solely by the FeeBreakdownInvalid check on line 331; the
+        // unchecked subtraction is safe-by-construction because that
+        // branch already enforces `outflows ≤ fillAmount`.
+        unchecked {
+            marketRetained[f.marketId] +=
+                f.fillAmount - f.sellerReceives - f.platformFee - f.makerFee;
+        }
+
         emit PositionEntered(f.marketId, uint8(f.order.option), f.fillAmount, f.order.maker);
         emit FillSettled(
             structHash,
@@ -420,23 +443,39 @@ contract UpDownSettlement is Ownable, EIP712 {
         emit MarketResolved(marketId, winner, int256(settlementPrice));
     }
 
+    /// @notice Hand the market's actual retained collateral to the relayer
+    ///         so it can pay winners off-chain via `Position.netShares × $1`.
+    ///         PR-Gap-bundle: pre-fix this used parimutuel `totalPool × (1 −
+    ///         feeBps/10000)` math, which has no relationship to what the
+    ///         contract actually holds under formula (c). The relayer would
+    ///         end up either short-paid (eating the gap from its own USDT
+    ///         balance) or over-paid (draining backing of unrelated open
+    ///         markets). Now we transfer exactly `marketRetained[marketId]`,
+    ///         which was accumulated atomically inside `enterPosition`.
+    ///
+    ///         `totalAccumulatedFees` is intentionally NOT incremented here.
+    ///         Pre-fix it was incremented by a phantom `fees` figure (fees
+    ///         had already left the contract atomically to `treasury` and
+    ///         `makerFeeRecipient`). Subsequent calls to `accumulateRebate`
+    ///         and `withdrawFees` would then "spend" that phantom — actually
+    ///         draining real per-market backing for open markets. Dropping
+    ///         the increment fully closes that drain. As a side-effect,
+    ///         `accumulateRebate` and `withdrawFees` now revert with
+    ///         `InsufficientAccumulatedFees` until a follow-up funds rebates
+    ///         from `treasury` rather than the contract.
     function withdrawSettlement(uint256 marketId) external onlyRelayer whenNotPaused {
         Market storage m = markets[marketId];
         if (!m.resolved) revert NotResolved();
         if (m.settled) revert AlreadySettled();
 
-        uint256 totalPool = uint256(m.totalUp) + uint256(m.totalDown);
-        uint256 feeBps = platformFeeBps + makerFeeBps;
-        uint256 fees = (totalPool * feeBps) / 10_000;
-        uint256 net = totalPool - fees;
-
+        uint256 retained = marketRetained[marketId];
         m.settled = true;
-        totalAccumulatedFees += fees;
+        delete marketRetained[marketId];
 
-        if (net > 0) {
-            usdt.safeTransfer(relayer, net);
+        if (retained > 0) {
+            usdt.safeTransfer(relayer, retained);
         }
-        emit SettlementWithdrawn(marketId, net, fees);
+        emit SettlementWithdrawn(marketId, retained, 0);
     }
 
     // ── DMM ─────────────────────────────────────────────────────────────
