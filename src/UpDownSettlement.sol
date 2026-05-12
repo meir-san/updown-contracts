@@ -26,7 +26,6 @@ contract UpDownSettlement is Ownable, EIP712 {
     error NotResolved();
     error AlreadySettled();
     error AlreadyResolved();
-    error NotDMM();
     error ZeroAddress();
     error Paused();
     error InvalidMarketWindow();
@@ -34,7 +33,6 @@ contract UpDownSettlement is Ownable, EIP712 {
     error InvalidSignature();
     error FillExceedsOrderAmount();
     // PR-16 (P1-15 + P1-16 + P1-17): cleanup batch
-    error InsufficientAccumulatedFees();
     error EmergencyProposalNotFound();
     error EmergencyTimelockActive();
     error EmergencyProposalAlreadyExists();
@@ -44,6 +42,15 @@ contract UpDownSettlement is Ownable, EIP712 {
     // PR-5-bundle (P0-7 + P0-13 + P0-17): atomic settlement
     error FeeBreakdownInvalid();
     error TreasuryNotConfigured();
+    /// @notice DMM rebate rebuild (2026-05-12 backend gate 4): `claimRebate`
+    ///         pulls from the treasury EOA via `transferFrom`. If treasury
+    ///         is unset, has insufficient USDT balance, or has insufficient
+    ///         allowance to this contract, the claim reverts loudly so
+    ///         DMMs and ops can tell a treasury problem apart from a
+    ///         "you have no accumulated rebate" no-op. `have` reflects
+    ///         the smaller of treasury balance and allowance — whichever
+    ///         constraint is binding.
+    error TreasuryUnderFunded(uint256 want, uint256 have);
 
     // ── Types ───────────────────────────────────────────────────────────
     /// @dev Packed for cheaper `createMarket` (fewer cold storage slots on first write).
@@ -94,15 +101,17 @@ contract UpDownSettlement is Ownable, EIP712 {
     event PositionEntered(uint256 indexed marketId, uint8 option, uint256 amount, address indexed maker);
     event MarketResolved(uint256 indexed marketId, uint8 winner, int256 settlementPrice);
     event SettlementWithdrawn(uint256 indexed marketId, uint256 netToRelayer, uint256 fees);
-    event DMMAdded(address indexed dmm);
-    event DMMRemoved(address indexed dmm);
-    event RebateAccumulated(address indexed dmm, uint256 amount);
+    /// @notice 2026-05-12 backend gate 4 (DMM rebate rebuild): event now
+    ///         emits for ANY maker that earns a rebate. The pre-rebuild
+    ///         `DMMAdded`/`DMMRemoved`/`NotDMM` whitelist gate has been
+    ///         removed — every maker accrues a rebate proportional to
+    ///         their maker fee. The parameter is named `maker` (not
+    ///         `dmm`) to reflect the broader semantic.
+    event RebateAccumulated(address indexed maker, uint256 amount);
     event RebateClaimed(address indexed claimant, uint256 amount);
     event PausedSet(bool paused);
     event FeesUpdated(uint256 platformFeeBps, uint256 makerFeeBps);
     event DmmRebateBpsUpdated(uint256 bps);
-    // PR-16 (P1-16): emit on owner withdraw + decrement counter atomically.
-    event FeesWithdrawn(address indexed to, uint256 amount, uint256 totalAfter);
     // PR-16 (P1-17): two-step emergency withdraw with 24h timelock.
     event EmergencyWithdrawProposed(address indexed token, address indexed to, uint256 amount, uint256 unlocksAt);
     event EmergencyWithdrawExecuted(address indexed token, address indexed to, uint256 amount);
@@ -144,12 +153,14 @@ contract UpDownSettlement is Ownable, EIP712 {
     uint256 public platformFeeBps;
     uint256 public makerFeeBps;
 
-    mapping(address => bool) public isDMM;
+    /// @notice 2026-05-12 backend gate 4: `isDMM` whitelist + `dmmCount` +
+    ///         `totalAccumulatedFees` removed. Rebates are now treasury-
+    ///         funded (pulled at claim time via `usdt.transferFrom`); the
+    ///         per-maker accumulator below is the only rebate-side state.
+    ///         Bps still configurable by owner.
     uint256 public dmmRebateBps;
     mapping(address => uint256) public dmmRebateAccumulated;
-    uint256 public dmmCount;
 
-    uint256 public totalAccumulatedFees;
     bool public paused;
 
     /// @notice Cumulative filled amount per signed order hash. Caps at `order.amount` to
@@ -478,51 +489,76 @@ contract UpDownSettlement is Ownable, EIP712 {
         emit SettlementWithdrawn(marketId, retained, 0);
     }
 
-    // ── DMM ─────────────────────────────────────────────────────────────
+    // ── Rebates ─────────────────────────────────────────────────────────
+    //
+    // 2026-05-12 backend gate 4 (post-Gap-#2 rebuild):
+    //
+    // Pre-Gap-#2: rebates were funded by the contract's `totalAccumulatedFees`
+    // counter — `accumulateRebate` decremented it, `claimRebate` paid out
+    // from the contract's USDT balance. Gap #2 fix routed `platformFee`
+    // atomically to `treasury` per fill (so off-chain dashboards could see
+    // fees via `usdt.balanceOf(treasury)` instead of a Mongo counter), and
+    // the fee counter was intentionally left un-incremented. That made the
+    // rebate path structurally unreachable.
+    //
+    // Rebuild design (Option D, approved 2026-05-12):
+    //
+    // - `accumulateRebate(maker, amount)` is now a pure accumulator-increment.
+    //   No balance constraint on the contract; no `isDMM` whitelist gate
+    //   (consistent with the broader "anyone market-makes, anyone earns
+    //   rebates" principle from the 2026-05-04 Decisions log).
+    // - `claimRebate()` pulls from the `treasury` EOA via
+    //   `usdt.safeTransferFrom(treasury, msg.sender, amt)`. Treasury holds
+    //   a standing `usdt.approve(address(this), MAX_UINT256)` as an
+    //   operational precondition (set once at deploy, re-issued if treasury
+    //   rotates).
+    //
+    // Value flow is one-direction: fills → treasury (via atomic `enterPosition`)
+    // → DMM claims. The contract holds no rebate pool of its own.
+    //
+    // Trust assumption (documented for the auditor): treasury's standing
+    // approval means if this settlement contract is compromised, treasury
+    // can be drained via crafted `claimRebate` calls (the attacker accrues
+    // arbitrary amounts via a compromised `accumulateRebate` path, then
+    // claims). For v1 this is the right tradeoff — settlement and treasury
+    // are co-deployed by the same team under a consistent trust assumption.
+    // Post-v1: consider rolling-cap allowance (treasury periodically
+    // re-approves a weekly rebate budget) if the threat model shifts.
 
-    function addDMM(address dmm) external onlyOwner {
-        if (dmm == address(0)) revert ZeroAddress();
-        if (!isDMM[dmm]) {
-            isDMM[dmm] = true;
-            unchecked {
-                ++dmmCount;
-            }
-        }
-        emit DMMAdded(dmm);
+    /// @notice Credit `maker`'s rebate accumulator. Any maker, not just
+    ///         whitelisted DMMs (whitelist removed 2026-05-12). Called by
+    ///         the relayer after off-chain fills via the matching engine's
+    ///         post-fill hook; the rebate amount is computed off-chain as
+    ///         `(makerFee * dmmRebateBps) / 10_000`. No fund movement here
+    ///         — just a counter increment. Pull-from-treasury happens at
+    ///         `claimRebate` time.
+    function accumulateRebate(address maker, uint256 amount) external onlyRelayer whenNotPaused {
+        dmmRebateAccumulated[maker] += amount;
+        emit RebateAccumulated(maker, amount);
     }
 
-    function removeDMM(address dmm) external onlyOwner {
-        if (isDMM[dmm]) {
-            isDMM[dmm] = false;
-            unchecked {
-                --dmmCount;
-            }
-        }
-        emit DMMRemoved(dmm);
-    }
-
-    /// @notice Credit a DMM's rebate accumulator from the contract's existing
-    ///         platform-fee balance (PR-16 / P1-15). Pre-fix this pulled
-    ///         external USDT from the relayer's wallet, decoupling rebate
-    ///         payments from the fee accumulation that was supposed to fund
-    ///         them. Now rebates come from `totalAccumulatedFees`, decremented
-    ///         atomically with the rebate credit.
-    function accumulateRebate(address dmm, uint256 amount) external onlyRelayer whenNotPaused {
-        if (!isDMM[dmm]) revert NotDMM();
-        if (amount > totalAccumulatedFees) revert InsufficientAccumulatedFees();
-        unchecked {
-            // amount <= totalAccumulatedFees, no underflow.
-            totalAccumulatedFees -= amount;
-        }
-        dmmRebateAccumulated[dmm] += amount;
-        emit RebateAccumulated(dmm, amount);
-    }
-
+    /// @notice Claim accumulated rebate. Pulls `amt` from the treasury EOA
+    ///         via `usdt.transferFrom`. Treasury must hold sufficient USDT
+    ///         balance AND have approved this contract to spend it. The
+    ///         `TreasuryUnderFunded(want, have)` revert distinguishes a
+    ///         treasury problem from a "no accumulated rebate" no-op
+    ///         (which is the `amt == 0` early-return below).
     function claimRebate() external {
         uint256 amt = dmmRebateAccumulated[msg.sender];
         if (amt == 0) return;
+        if (treasury == address(0)) revert TreasuryUnderFunded(amt, 0);
+
+        // Binding constraint is `min(balance, allowance)` — whichever is
+        // smaller is what `transferFrom` would actually succeed with.
+        // Surfacing it in the error gives ops a clear "fund treasury" vs
+        // "re-approve allowance" signal.
+        uint256 balance = usdt.balanceOf(treasury);
+        uint256 allowance = usdt.allowance(treasury, address(this));
+        uint256 have = balance < allowance ? balance : allowance;
+        if (have < amt) revert TreasuryUnderFunded(amt, have);
+
         dmmRebateAccumulated[msg.sender] = 0;
-        usdt.safeTransfer(msg.sender, amt);
+        usdt.safeTransferFrom(treasury, msg.sender, amt);
         emit RebateClaimed(msg.sender, amt);
     }
 
@@ -569,27 +605,15 @@ contract UpDownSettlement is Ownable, EIP712 {
         emit DmmRebateBpsUpdated(bps);
     }
 
-    /// @notice Pull accumulated platform/maker fees to the owner. Decrements
-    ///         the on-chain counter in lockstep so off-chain dashboards can
-    ///         trust `getAccumulatedFees()` (PR-16 / P1-16). Reverts if more
-    ///         than the accumulator is requested — prevents accidental drain
-    ///         of contract balance backing in-flight rebates or partially-filled
-    ///         orders.
-    function withdrawFees(uint256 amount) external onlyOwner {
-        if (amount > totalAccumulatedFees) revert InsufficientAccumulatedFees();
-        unchecked {
-            totalAccumulatedFees -= amount;
-        }
-        usdt.safeTransfer(msg.sender, amount);
-        emit FeesWithdrawn(msg.sender, amount, totalAccumulatedFees);
-    }
-
-    /// @notice Read accumulated fees available for withdraw. Pure convenience —
-    ///         the public storage slot is already readable, but a typed getter
-    ///         is clearer for ABI consumers and dashboards.
-    function getAccumulatedFees() external view returns (uint256) {
-        return totalAccumulatedFees;
-    }
+    // 2026-05-12 backend gate 4: `withdrawFees(uint256)` and
+    // `getAccumulatedFees()` removed. They read/decremented
+    // `totalAccumulatedFees`, which was structurally dead post-Gap-#2
+    // (fees flow atomically to `treasury` per fill via `enterPosition` —
+    // the contract no longer holds fee accumulation). The functions
+    // confused the storage model and would have reverted on any call;
+    // their `FeesWithdrawn` event and `InsufficientAccumulatedFees`
+    // error are also gone. Treasury withdraws happen off-chain by the
+    // treasury EOA's owner — settlement is not in that path.
 
     /// @notice Step 1 of emergency withdraw (PR-16 / P1-17). Records intent
     ///         and a 24-hour unlock timestamp; nothing transfers yet. Audit

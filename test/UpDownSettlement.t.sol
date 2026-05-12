@@ -45,6 +45,12 @@ contract UpDownSettlementTest is Test {
         s.setAutocycler(autocycler);
         s.setResolver(resolver);
         s.setRelayer(relayer);
+        // 2026-05-12 (backend gate 4): treasury is now load-bearing for the
+        // rebate path (claim pulls via transferFrom). Set in fixture so
+        // rebate tests can fund/approve from `s.treasury()`. Tests that
+        // need the "treasury unset" edge case construct a fresh
+        // UpDownSettlement locally and skip this setter.
+        s.setTreasury(makeAddr("treasury"));
 
         maker = vm.createWallet("maker");
         usdt.mint(maker.addr, 10_000_000e18);
@@ -500,9 +506,9 @@ contract UpDownSettlementTest is Test {
     /// figure that had no relationship to formula (c) outflows.
     /// `_fill` here passes sellerReceives=platformFee=makerFee=0, so the
     /// contract retains the entire fillAmount per fill — the relayer
-    /// receives 2000e18 and `totalAccumulatedFees` stays at 0 (fees never
-    /// accumulate in-contract under formula (c) — they leave atomically
-    /// inside `enterPosition`).
+    /// receives 2000e18 on withdraw. (Historical note: the prior
+    /// assertion that `totalAccumulatedFees()` stayed at 0 was removed
+    /// alongside the counter itself in the 2026-05-12 rebate rebuild.)
     function test_withdrawSettlementFees() public {
         vm.prank(autocycler);
         uint256 mid = s.createMarket(PAIR, 300, 1e18);
@@ -522,10 +528,9 @@ contract UpDownSettlementTest is Test {
         s.withdrawSettlement(mid);
 
         // Post-withdraw: relayer holds the full retained, on-chain
-        // bookkeeping is cleared, fee counter unchanged.
+        // bookkeeping is cleared.
         assertEq(usdt.balanceOf(relayer), relBefore + 2000e18);
         assertEq(s.marketRetained(mid), 0);
-        assertEq(s.totalAccumulatedFees(), 0);
 
         UpDownSettlement.Market memory m = s.getMarket(mid);
         assertTrue(m.settled);
@@ -560,51 +565,177 @@ contract UpDownSettlementTest is Test {
         s.withdrawSettlement(mid);
     }
 
-    function test_dmmAddRemove() public {
-        address dmm = address(0xd00);
-        s.addDMM(dmm);
-        assertTrue(s.isDMM(dmm));
-        assertEq(s.dmmCount(), 1);
-        s.removeDMM(dmm);
-        assertFalse(s.isDMM(dmm));
-        assertEq(s.dmmCount(), 0);
+    // ── DMM rebate rebuild tests (2026-05-12 backend gate 4) ───────────
+    //
+    // Pre-rebuild: addDMM/removeDMM/isDMM/dmmCount whitelist gated
+    // accumulateRebate, totalAccumulatedFees gated funding, and
+    // withdrawFees/getAccumulatedFees were the owner-side counter
+    // controls. All of that is gone. Tests below pin the new shape:
+    // any maker accrues rebate; claim pulls from treasury via
+    // transferFrom; loud `TreasuryUnderFunded(want, have)` on
+    // insufficient treasury balance/allowance.
+
+    /// @notice Helper: treasury approves settlement to spend MAX_UINT256
+    ///         and is funded with `fundAmount` USDT. Operational
+    ///         precondition for `claimRebate` to succeed.
+    function _seedTreasuryForRebates(uint256 fundAmount) internal {
+        require(s.treasury() != address(0), "treasury must be set first");
+        usdt.mint(s.treasury(), fundAmount);
+        vm.prank(s.treasury());
+        usdt.approve(address(s), type(uint256).max);
     }
 
-    /// PR-Gap-bundle reframe (was: test_rebateAccumulateAndClaim happy path):
-    /// under formula (c), `totalAccumulatedFees` is intentionally never
-    /// incremented — fees leave the contract atomically inside
-    /// `enterPosition` (to `treasury` and `makerFeeRecipient`). The
-    /// pre-bundle DMM rebate path that drew from the in-contract fee
-    /// bucket is therefore unreachable until a follow-up rebuilds it
-    /// against `treasury` rather than the contract. This test now pins
-    /// the new invariant: even after a fully settled market, accumulating
-    /// any non-zero rebate reverts.
-    function test_postGap_dmmRebatePathUnreachable() public {
-        address dmm = address(0xd00);
-        s.addDMM(dmm);
-
-        vm.prank(autocycler);
-        uint256 mid = s.createMarket(PAIR, 300, 1e18);
-        _fill(mid, 1, 1000e18, 60);
-        _fill(mid, 2, 1000e18, 61);
-        vm.warp(block.timestamp + 301);
-        vm.prank(resolver);
-        s.resolve(mid, 2e18, 1);
+    function test_rebate_anyMakerCanAccrue_noWhitelist() public {
+        // Random non-whitelisted address — pre-rebuild this would have
+        // reverted with NotDMM. Post-rebuild, no gate.
+        address maker = address(0xd00);
         vm.prank(relayer);
-        s.withdrawSettlement(mid);
+        s.accumulateRebate(maker, 100e18);
+        assertEq(s.dmmRebateAccumulated(maker), 100e18, "any maker accrues without whitelist");
+    }
 
-        // Post-settlement, the fee counter must still be zero — fees are
-        // not in-contract under formula (c).
-        assertEq(s.totalAccumulatedFees(), 0);
+    function test_rebate_accumulateRebate_revertsWhenNotRelayer() public {
+        // Authorization preserved: only the relayer can credit rebates.
+        // Critical invariant — without this anyone could spoof rebate
+        // credit and drain the treasury at claim time.
+        address maker = address(0xd00);
+        vm.expectRevert(UpDownSettlement.OnlyRelayer.selector);
+        s.accumulateRebate(maker, 100e18);
+    }
 
+    function test_rebate_accumulateRebate_emitsEvent() public {
+        address maker = address(0xd00);
+        vm.expectEmit(true, false, false, true);
+        emit UpDownSettlement.RebateAccumulated(maker, 42e18);
         vm.prank(relayer);
-        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
-        s.accumulateRebate(dmm, 1);
+        s.accumulateRebate(maker, 42e18);
+    }
 
-        // DMM never received anything — rebate funding mechanism is
-        // intentionally disabled until the follow-up.
-        assertEq(s.dmmRebateAccumulated(dmm), 0);
-        assertEq(usdt.balanceOf(dmm), 0);
+    function test_rebate_claimRebate_happyPath_pullsFromTreasury() public {
+        address maker = address(0xd00);
+        _seedTreasuryForRebates(1000e18);
+        vm.prank(relayer);
+        s.accumulateRebate(maker, 100e18);
+
+        uint256 treasuryBefore = usdt.balanceOf(s.treasury());
+        uint256 makerBefore = usdt.balanceOf(maker);
+
+        vm.prank(maker);
+        s.claimRebate();
+
+        // Funds moved treasury → maker; accumulator drained.
+        assertEq(usdt.balanceOf(maker), makerBefore + 100e18, "maker received rebate");
+        assertEq(usdt.balanceOf(s.treasury()), treasuryBefore - 100e18, "treasury paid rebate");
+        assertEq(s.dmmRebateAccumulated(maker), 0, "accumulator zeroed");
+    }
+
+    function test_rebate_claimRebate_revertsWhenTreasuryUnderfunded_byBalance() public {
+        address maker = address(0xd00);
+        // Treasury approves but has no USDT to pay.
+        vm.prank(s.treasury());
+        usdt.approve(address(s), type(uint256).max);
+        vm.prank(relayer);
+        s.accumulateRebate(maker, 100e18);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(UpDownSettlement.TreasuryUnderFunded.selector, 100e18, 0)
+        );
+        vm.prank(maker);
+        s.claimRebate();
+
+        // Accumulator preserved — claim can be retried after treasury is funded.
+        assertEq(s.dmmRebateAccumulated(maker), 100e18);
+    }
+
+    function test_rebate_claimRebate_revertsWhenTreasuryUnderfunded_byAllowance() public {
+        address maker = address(0xd00);
+        usdt.mint(s.treasury(), 1000e18);
+        // Treasury has USDT but allowance is below the claim amount.
+        vm.prank(s.treasury());
+        usdt.approve(address(s), 50e18);
+        vm.prank(relayer);
+        s.accumulateRebate(maker, 100e18);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(UpDownSettlement.TreasuryUnderFunded.selector, 100e18, 50e18)
+        );
+        vm.prank(maker);
+        s.claimRebate();
+    }
+
+    function test_rebate_claimRebate_revertsWhenTreasuryUnset() public {
+        // Edge case: treasury was never set (or unset somehow). The
+        // address(0) early-check surfaces this as `TreasuryUnderFunded(amt, 0)`
+        // rather than letting the call attempt a transferFrom on the
+        // zero address.
+        UpDownSettlement noTreasury = new UpDownSettlement(usdt, address(this), 70, 80);
+        noTreasury.setRelayer(relayer);
+
+        address maker = address(0xd00);
+        vm.prank(relayer);
+        noTreasury.accumulateRebate(maker, 100e18);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(UpDownSettlement.TreasuryUnderFunded.selector, 100e18, 0)
+        );
+        vm.prank(maker);
+        noTreasury.claimRebate();
+    }
+
+    function test_rebate_claimRebate_zeroAccumulatorIsNoOp() public {
+        address maker = address(0xd00);
+        // No prior accumulation. Claim should silently no-op (not revert).
+        vm.prank(maker);
+        s.claimRebate();
+        assertEq(usdt.balanceOf(maker), 0);
+    }
+
+    function test_rebate_claimRebate_emitsEvent() public {
+        address maker = address(0xd00);
+        _seedTreasuryForRebates(1000e18);
+        vm.prank(relayer);
+        s.accumulateRebate(maker, 100e18);
+
+        vm.expectEmit(true, false, false, true);
+        emit UpDownSettlement.RebateClaimed(maker, 100e18);
+        vm.prank(maker);
+        s.claimRebate();
+    }
+
+    function test_rebate_accumulateThenClaimAcrossMultipleFills() public {
+        // Three accumulate calls before claim — batches into one transferFrom.
+        address maker = address(0xd00);
+        _seedTreasuryForRebates(1000e18);
+        vm.startPrank(relayer);
+        s.accumulateRebate(maker, 10e18);
+        s.accumulateRebate(maker, 20e18);
+        s.accumulateRebate(maker, 30e18);
+        vm.stopPrank();
+        assertEq(s.dmmRebateAccumulated(maker), 60e18, "accumulator sums across calls");
+
+        vm.prank(maker);
+        s.claimRebate();
+        assertEq(usdt.balanceOf(maker), 60e18, "one claim drains all three credits");
+    }
+
+    function test_rebate_settersDoNotExistOnAbi() public {
+        // Regression-guard sister of F-04: addDMM/removeDMM/withdrawFees/
+        // getAccumulatedFees no longer exist on the ABI. Catches a
+        // future re-introduction via the low-level-call pattern.
+        (bool ok1,) = address(s).call(abi.encodeWithSignature("addDMM(address)", address(0)));
+        assertFalse(ok1, "addDMM must not exist post-rebuild");
+        (bool ok2,) = address(s).call(abi.encodeWithSignature("removeDMM(address)", address(0)));
+        assertFalse(ok2, "removeDMM must not exist post-rebuild");
+        (bool ok3,) = address(s).call(abi.encodeWithSignature("withdrawFees(uint256)", uint256(0)));
+        assertFalse(ok3, "withdrawFees must not exist post-rebuild");
+        (bool ok4,) = address(s).call(abi.encodeWithSignature("getAccumulatedFees()"));
+        assertFalse(ok4, "getAccumulatedFees must not exist post-rebuild");
+        (bool ok5,) = address(s).call(abi.encodeWithSignature("totalAccumulatedFees()"));
+        assertFalse(ok5, "totalAccumulatedFees getter must not exist post-rebuild");
+        (bool ok6,) = address(s).call(abi.encodeWithSignature("isDMM(address)", address(0)));
+        assertFalse(ok6, "isDMM getter must not exist post-rebuild");
+        (bool ok7,) = address(s).call(abi.encodeWithSignature("dmmCount()"));
+        assertFalse(ok7, "dmmCount getter must not exist post-rebuild");
     }
 
     function test_fullCycle() public {
@@ -625,94 +756,27 @@ contract UpDownSettlementTest is Test {
         assertTrue(m.resolved && m.settled);
     }
 
-    function test_accumulateRebateNotDmmReverts() public {
-        // PR-16: relayer's external balance no longer matters here. Just
-        // ensure the not-DMM path reverts without funding the contract.
-        vm.prank(relayer);
-        vm.expectRevert(UpDownSettlement.NotDMM.selector);
-        s.accumulateRebate(address(0x123), 1e18);
-    }
+    // ── PR-16 (P1-17 + P1-18) — emergency withdraw timelock ─────────────
+    //
+    // (P1-15 + P1-16 ownerWithdrawFees + accumulator-revert tests deleted
+    // 2026-05-12 alongside the rebate rebuild: `withdrawFees`,
+    // `getAccumulatedFees`, `totalAccumulatedFees`, `InsufficientAccumulatedFees`,
+    // and `NotDMM` are all gone. The 8 obsolete tests covering them
+    // have been removed; rebate behavior is now covered by the new
+    // `test_rebate_*` block above.)
 
-    function test_ownerWithdrawFees() public {
-        vm.prank(autocycler);
-        uint256 mid = s.createMarket(PAIR, 300, 1e18);
-        _fill(mid, 1, 1000e18, 50);
-        vm.warp(block.timestamp + 301);
-        vm.prank(resolver);
-        s.resolve(mid, 2e18, 1);
-        vm.prank(relayer);
-        s.withdrawSettlement(mid);
-
-        uint256 fees = s.totalAccumulatedFees();
-        address deployerAddr = address(this);
-        uint256 beforeB = usdt.balanceOf(deployerAddr);
-        s.withdrawFees(fees);
-        assertEq(usdt.balanceOf(deployerAddr), beforeB + fees);
-        // PR-16 (P1-16): counter decrements in lockstep with the transfer.
-        assertEq(s.totalAccumulatedFees(), 0);
-    }
-
-    // ── PR-16 (P1-15 + P1-16 + P1-17 + P1-18) ─────────────────────────
-
-    /// @dev Helper: leave the contract holding some USDT so withdraw-fee /
-    ///      emergency-withdraw tests have something to draw from. Pre
-    ///      PR-Gap-bundle this seeded `totalAccumulatedFees` via the
-    ///      pre-fix `withdrawSettlement` path; under formula (c) that
-    ///      path no longer increments the counter, so we mint USDT
-    ///      directly into the contract instead. The fees counter
-    ///      stays at 0, which is the correct post-fix invariant.
-    function _settleOneMarketForFees() internal returns (uint256 feesAfter) {
+    /// @dev Helper: mint USDT directly into the contract so the
+    ///      emergency-withdraw tests have a non-zero balance to act on.
+    ///      The contract no longer accumulates fees of its own (fees flow
+    ///      atomically to treasury per fill), so direct mint is the
+    ///      simplest fixture seed.
+    function _seedContractUsdt() internal {
         usdt.mint(address(s), 100e18);
-        return s.totalAccumulatedFees();
-    }
-
-    function test_pr16_accumulateRebate_revertsWhenAmountExceedsFees() public {
-        address dmm = address(0xd00);
-        s.addDMM(dmm);
-        // No prior settlement → totalAccumulatedFees == 0.
-        vm.prank(relayer);
-        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
-        s.accumulateRebate(dmm, 1);
-    }
-
-    /// PR-Gap-bundle reframe: the pre-fix decrement-on-rebate path is
-    /// unreachable under formula (c). The single-revert `…revertsWhenAmount
-    /// ExceedsFees` test above is now the canonical assertion that
-    /// rebate accumulation is gated on a counter that's always zero.
-    /// This test is preserved as a marker for the follow-up that should
-    /// rebuild rebates against `treasury` rather than the contract.
-    function test_postGap_rebateDecrementMechanismIsDisabled() public {
-        address dmm = address(0xd00);
-        s.addDMM(dmm);
-        // No path increments totalAccumulatedFees under formula (c).
-        assertEq(s.totalAccumulatedFees(), 0);
-        vm.prank(relayer);
-        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
-        s.accumulateRebate(dmm, 1);
-    }
-
-    function test_pr16_withdrawFees_revertsWhenAmountExceedsAccumulator() public {
-        uint256 fees = _settleOneMarketForFees();
-        // Try to over-withdraw by 1.
-        vm.expectRevert(UpDownSettlement.InsufficientAccumulatedFees.selector);
-        s.withdrawFees(fees + 1);
-    }
-
-    function test_pr16_withdrawFees_emitsEventWithTotalAfter() public {
-        uint256 fees = _settleOneMarketForFees();
-        vm.expectEmit(true, false, false, true);
-        emit UpDownSettlement.FeesWithdrawn(address(this), fees, 0);
-        s.withdrawFees(fees);
-    }
-
-    function test_pr16_getAccumulatedFees_matchesStorage() public {
-        uint256 fees = _settleOneMarketForFees();
-        assertEq(s.getAccumulatedFees(), fees);
     }
 
     function test_pr16_emergencyWithdraw_proposeThenExecuteAfter24h() public {
         // Seed the contract with some USDT to withdraw (via the fee path).
-        _settleOneMarketForFees();
+        _seedContractUsdt();
         uint256 contractBalanceBefore = usdt.balanceOf(address(s));
         require(contractBalanceBefore >= 1e18, "fixture: need balance");
 
@@ -733,7 +797,7 @@ contract UpDownSettlementTest is Test {
     }
 
     function test_pr16_emergencyWithdraw_revertsBeforeTimelock() public {
-        _settleOneMarketForFees();
+        _seedContractUsdt();
         bytes32 proposalId = s.proposeEmergencyWithdraw(address(usdt), makeAddr("r"), 1e18);
         vm.warp(block.timestamp + 23 hours + 59 minutes);
         vm.expectRevert(UpDownSettlement.EmergencyTimelockActive.selector);
@@ -741,7 +805,7 @@ contract UpDownSettlementTest is Test {
     }
 
     function test_pr16_emergencyWithdraw_canBeCancelled() public {
-        _settleOneMarketForFees();
+        _seedContractUsdt();
         bytes32 proposalId = s.proposeEmergencyWithdraw(address(usdt), makeAddr("r"), 1e18);
         s.cancelEmergencyWithdraw(proposalId);
         // Subsequent execute reverts as not-found.
@@ -776,7 +840,7 @@ contract UpDownSettlementTest is Test {
     }
 
     function test_pr16_emergencyWithdraw_distinctNonceForIdenticalProposals() public {
-        _settleOneMarketForFees();
+        _seedContractUsdt();
         address recipient = makeAddr("r");
         bytes32 a = s.proposeEmergencyWithdraw(address(usdt), recipient, 1e18);
         bytes32 b = s.proposeEmergencyWithdraw(address(usdt), recipient, 1e18);
@@ -856,19 +920,30 @@ contract UpDownSettlementTest is Test {
     }
 
     function test_pr5_treasuryNotConfigured_revertsWhenPlatformFeeOnZeroAddress() public {
-        // No setTreasury — fee path should fail closed.
+        // 2026-05-12 (backend gate 4): setUp() now seeds a treasury for
+        // the rebate-claim path, so this test constructs a fresh
+        // UpDownSettlement locally to recreate the "treasury never set"
+        // state without breaking the shared fixture.
+        UpDownSettlement sNoTreas = new UpDownSettlement(usdt, owner, 70, 80);
+        sNoTreas.setAutocycler(autocycler);
+        sNoTreas.setResolver(resolver);
+        sNoTreas.setRelayer(relayer);
+        // Maker approval against the fresh contract.
+        vm.prank(maker.addr);
+        usdt.approve(address(sNoTreas), type(uint256).max);
+
         vm.prank(autocycler);
-        uint256 mid = s.createMarket(PAIR, 300, 1e18);
+        uint256 mid = sNoTreas.createMarket(PAIR, 300, 1e18);
         address sellerEoa = makeAddr("sellerNoTreas");
         usdt.mint(sellerEoa, 10_000e18);
         vm.prank(sellerEoa);
-        usdt.approve(address(s), type(uint256).max);
+        usdt.approve(address(sNoTreas), type(uint256).max);
 
         UpDownSettlement.Order memory order = UpDownSettlement.Order({
             maker: maker.addr, market: mid, option: 1, side: 0, orderType: 0,
             price: 5500, amount: 100e18, nonce: 102, expiry: block.timestamp + 3600
         });
-        bytes32 digest = s.orderDigest(order);
+        bytes32 digest = sNoTreas.orderDigest(order);
         (uint8 v, bytes32 r, bytes32 sSig) = vm.sign(maker.privateKey, digest);
         bytes memory sig = abi.encodePacked(r, sSig, v);
         UpDownSettlement.FillInputs memory f = UpDownSettlement.FillInputs({
@@ -878,16 +953,17 @@ contract UpDownSettlementTest is Test {
         });
         vm.prank(relayer);
         vm.expectRevert(UpDownSettlement.TreasuryNotConfigured.selector);
-        s.enterPosition(f);
+        sNoTreas.enterPosition(f);
     }
 
     function test_pr5_makerRebateForNonDmmMaker_paid() public {
         // PR-5-bundle (P0-17): rebates flow to ALL makers, not just DMMs.
         // The contract has no DMM check on enterPosition — the relayer
         // computes makerFee for every maker and the contract pays them.
+        // Post-2026-05-12 rebate rebuild: the entire `isDMM` whitelist is
+        // gone, so this test no longer asserts "non-DMM" status (there's
+        // no such status anymore — every maker is treated identically).
         (uint256 mid,, address sellerEoa,) = _atomicFixture();
-        // maker (the resting BUY side) is NOT registered as a DMM.
-        assertFalse(s.isDMM(maker.addr));
 
         uint256 makerBefore = usdt.balanceOf(maker.addr);
         // 100 fill, 95 to seller, 1 platform, 1 maker rebate. Buyer = maker.
