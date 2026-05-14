@@ -62,6 +62,10 @@ contract ThinWallet is EIP712 {
     // ── Errors ──────────────────────────────────────────────────────────
     error ZeroOwner();
     error NotOwner();
+    error ZeroTarget();
+    error ExecuteExpired(uint256 deadline, uint256 nowTs);
+    error NonceAlreadyUsed(uint256 nonce);
+    error BadSignature();
 
     // ── Constants ───────────────────────────────────────────────────────
     /// @notice ERC-1271 magic return value: `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
@@ -73,12 +77,34 @@ contract ThinWallet is EIP712 {
     ///         binding the signature to this specific wallet address.
     bytes32 private constant WALLET_AUTH_TYPEHASH = keccak256("WalletAuth(bytes32 hash)");
 
+    /// @notice EIP-712 type hash for the `executeWithSig` meta-tx envelope.
+    ///         Authorizes any caller to invoke `target.call(data)` from this
+    ///         wallet, exactly once, before `deadline`, on behalf of `owner`.
+    ///         Replay-safe across nonces (consumed in-tx), wallets
+    ///         (`verifyingContract` in domain), and chains (`chainId` in
+    ///         domain). Standard meta-tx pattern — Safe / Argent / EIP-4337.
+    bytes32 private constant EXECUTE_WITH_SIG_TYPEHASH =
+        keccak256("ExecuteWithSig(address target,bytes data,uint256 nonce,uint256 deadline)");
+
     // ── State ───────────────────────────────────────────────────────────
     address public immutable owner;
+
+    /// @notice Per-nonce replay guard for `executeWithSig`. Owner picks
+    ///         nonces; frontend convention is monotonic-per-wallet starting
+    ///         from 0 to keep audit trails readable. Public getter lets
+    ///         off-chain consumers check whether a given nonce is still
+    ///         spendable without crafting a probe tx.
+    mapping(uint256 => bool) public usedNonces;
 
     // ── Events ──────────────────────────────────────────────────────────
     event Withdrawn(address indexed token, uint256 amount);
     event SettlementApproved(address indexed token, address indexed settlement, uint256 amount);
+    /// @notice Emitted on each successful `executeWithSig` call. Off-chain
+    ///         indexers map (target, nonce) back to user authorizations.
+    ///         `recovered` deliberately not included — by tx-revert
+    ///         invariant it always equals `owner`; explicit field would
+    ///         waste gas + indexer storage.
+    event Executed(address indexed target, uint256 indexed nonce, bytes data);
 
     // ── Constructor ─────────────────────────────────────────────────────
     /// @param _owner the EOA that will sign on behalf of this wallet.
@@ -147,5 +173,78 @@ contract ThinWallet is EIP712 {
     ///         address(this)` directly on-chain.
     function domainSeparator() external view returns (bytes32) {
         return _domainSeparatorV4();
+    }
+
+    // ── Meta-tx (Phase 4 Gate) ──────────────────────────────────────────
+    /// @notice Execute an arbitrary call from this wallet, authorized by an
+    ///         owner-signed EIP-712 typed-data envelope. Standard meta-tx
+    ///         pattern (Safe / Argent / EIP-4337 family). Same domain +
+    ///         signature recovery primitives as `isValidSignature` — relies
+    ///         on the same `address(this)` binding via OZ `_hashTypedDataV4`
+    ///         so a sig made for Wallet A cannot replay against Wallet B.
+    ///
+    /// @param target the contract (or EOA) to call (e.g. USDTM for `approve(...)`).
+    /// @param data the calldata to send. Decoded by `target`, not this wallet.
+    ///             Empty bytes are allowed and forwarded verbatim — target
+    ///             contract semantics decide what an empty call means.
+    /// @param nonce a one-time nonce. Reverts `NonceAlreadyUsed(nonce)` if
+    ///              the same nonce has been used on this wallet before.
+    /// @param deadline unix seconds; reverts `ExecuteExpired(...)` if
+    ///                 `block.timestamp > deadline`. Frontend convention is
+    ///                 ~1 hour from sign time.
+    /// @param signature the owner's EIP-712 signature over the typed envelope.
+    /// @return ret the raw return data from `target.call(data)`. Surfaces
+    ///             whatever the inner call returned; caller decodes per
+    ///             target ABI.
+    ///
+    /// @dev Reverts on:
+    ///   - `target == address(0)`             → `ZeroTarget`
+    ///   - `block.timestamp > deadline`       → `ExecuteExpired`
+    ///   - `usedNonces[nonce] == true`        → `NonceAlreadyUsed`
+    ///   - signature recovery error or owner mismatch → `BadSignature`
+    ///   - underlying `target.call(data)` reverts → bubbles the inner
+    ///     revert data verbatim via assembly (preserves selector + payload
+    ///     so callers see e.g. `ERC20InsufficientAllowance(...)` not a
+    ///     stringified "call failed")
+    ///
+    /// @dev Re-entrancy: NOT guarded. Architectural decision — owner's
+    ///      per-nonce signature IS the guard. A re-entrant call with a
+    ///      different valid nonce + sig is, by construction, a separate
+    ///      explicit authorization from the owner. Same posture as Safe.
+    function executeWithSig(
+        address target,
+        bytes calldata data,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external returns (bytes memory ret) {
+        if (target == address(0)) revert ZeroTarget();
+        if (block.timestamp > deadline) revert ExecuteExpired(deadline, block.timestamp);
+        if (usedNonces[nonce]) revert NonceAlreadyUsed(nonce);
+
+        bytes32 structHash = keccak256(
+            abi.encode(EXECUTE_WITH_SIG_TYPEHASH, target, keccak256(data), nonce, deadline)
+        );
+        bytes32 digest = _hashTypedDataV4(structHash);
+
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError || recovered != owner) revert BadSignature();
+
+        // Consume nonce BEFORE the external call (checks-effects-interactions).
+        usedNonces[nonce] = true;
+
+        bool ok;
+        (ok, ret) = target.call(data);
+        if (!ok) {
+            // Bubble inner revert verbatim — preserves selector + payload
+            // so callers see e.g. `ERC20InsufficientAllowance(...)` rather
+            // than a stringified wrapper. mload(ret) is the bytes length;
+            // add(ret, 32) points past the length prefix to the data.
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+
+        emit Executed(target, nonce, data);
     }
 }
