@@ -22,11 +22,16 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///                                     (Arbitrum Sepolia testnet: 0x2ff010DEbC1297f19579B4246cad07bd24F2488A)
 ///   CHAINLINK_LINK_TOKEN_ADDRESS    — LINK token address on the target network
 ///                                     (Arbitrum One: 0xf97f4df75117a78c1A5a0DBb814Af92458539FB4)
+///   CHAINLINK_BTC_USD_FEED          — BTC/USD AggregatorV3 (strike-side, push-based)
+///                                     Arbitrum One:     0x6ce185860a4963106506C203335A2910413708e9
+///                                     Arbitrum Sepolia: deploy `MockAggregatorV3` and supply its addr.
+///   CHAINLINK_ETH_USD_FEED          — ETH/USD AggregatorV3 (strike-side)
+///                                     Arbitrum One:     0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
+///                                     Arbitrum Sepolia: deploy `MockAggregatorV3` and supply its addr.
+///   CHAINLINK_SEQUENCER_FEED        — L2 sequencer uptime feed
+///                                     Arbitrum One:     0xFdB631F5EE196F0ed6FAa767959853A9F217697D
+///                                     Arbitrum Sepolia: deploy `MockAggregatorV3(0, 0, 1)` (answer=0, ancient updatedAt).
 contract DeployUpDown is Script {
-    // ── Chainlink addresses (Arbitrum Mainnet) ──────────────────────────
-    address constant CHAINLINK_BTC_USD = 0x6ce185860a4963106506C203335A2910413708e9;
-    address constant CHAINLINK_ETH_USD = 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612;
-    address constant CHAINLINK_SEQUENCER = 0xFdB631F5EE196F0ed6FAa767959853A9F217697D;
 
     // ── Pair IDs ────────────────────────────────────────────────────────
     bytes32 constant BTCUSD = keccak256("BTC/USD");
@@ -50,6 +55,13 @@ contract DeployUpDown is Script {
         // script. On Arbitrum One, LINK = 0xf97f4df75117a78c1A5a0DBb814Af92458539FB4.
         address verifierProxy = vm.envAddress("CHAINLINK_VERIFIER_PROXY_ADDRESS");
         address linkToken = vm.envAddress("CHAINLINK_LINK_TOKEN_ADDRESS");
+        // Strike-side feeds + sequencer feed. Env-driven so the same
+        // script targets both Arbitrum One (real Chainlink addresses) and
+        // Arbitrum Sepolia (MockAggregatorV3 deploys) — see header doc
+        // for the canonical addresses on each network.
+        address btcUsdFeed = vm.envAddress("CHAINLINK_BTC_USD_FEED");
+        address ethUsdFeed = vm.envAddress("CHAINLINK_ETH_USD_FEED");
+        address sequencerFeed = vm.envAddress("CHAINLINK_SEQUENCER_FEED");
 
         console.log("Deployer:", deployer);
         console.log("USDT:", usdt);
@@ -64,11 +76,11 @@ contract DeployUpDown is Script {
 
         ChainlinkResolver resolver = new ChainlinkResolver(
             deployer,
-            CHAINLINK_SEQUENCER,
+            sequencerFeed,
             BTCUSD,
-            CHAINLINK_BTC_USD,
+            btcUsdFeed,
             ETHUSD,
-            CHAINLINK_ETH_USD,
+            ethUsdFeed,
             address(settlement),
             verifierProxy,
             linkToken
