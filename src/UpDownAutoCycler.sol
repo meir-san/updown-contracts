@@ -112,9 +112,19 @@ contract UpDownAutoCycler is Ownable {
     }
 
     /// @dev Encoded in performData alongside resolve indices for market creation.
+    ///
+    /// Streams-strike (2026-05-16): `signedReport` carries the Chainlink
+    /// Data Streams report blob used to capture the strike for this slot.
+    /// `checkUpkeep` emits CreateSlot with empty `signedReport`; the upkeep
+    /// coordinator (dev-keeper on dev, Chainlink Automation StreamsLookup
+    /// in production) fetches the per-slot report off-chain and fills in
+    /// `signedReport` before calling `performUpkeep`. The Resolver verifies
+    /// the report + extracts the strike at `_createMarket` time.
     struct CreateSlot {
         bytes32 pairId;
         uint256 tfIdx;
+        uint64 plannedStart;  // pre-computed by checkUpkeep so the coordinator knows the exact slot boundary to fetch a report for
+        bytes signedReport;
     }
 
     // ── Constants ───────────────────────────────────────────────────────
@@ -291,7 +301,20 @@ contract UpDownAutoCycler is Ownable {
                 for (uint256 ti; ti < NUM_TIMEFRAMES; ++ti) {
                     TimeframeConfig storage tft = timeframes[ti];
                     if (tft.active && block.timestamp + preWin >= pairTfLastCreated[pid][ti] + tft.duration) {
-                        createSlots[ci++] = CreateSlot({pairId: pid, tfIdx: ti});
+                        // Streams-strike: plannedStart is the clock-aligned boundary
+                        // the upkeep coordinator needs to fetch a report for.
+                        // `signedReport` is empty here — coordinator fills it in
+                        // before calling performUpkeep.
+                        uint256 lastStart = pairTfLastCreated[pid][ti];
+                        uint256 plannedStart = lastStart == 0
+                            ? (block.timestamp / tft.duration) * tft.duration
+                            : lastStart + tft.duration;
+                        createSlots[ci++] = CreateSlot({
+                            pairId: pid,
+                            tfIdx: ti,
+                            plannedStart: uint64(plannedStart),
+                            signedReport: bytes("")
+                        });
                     }
                 }
             }
@@ -329,7 +352,7 @@ contract UpDownAutoCycler is Ownable {
         // Phase B: create new markets (external self-call so try/catch can recover)
         for (uint256 i; i < createSlots.length; ++i) {
             CreateSlot memory slot = createSlots[i];
-            try this._createMarketExternal(slot.tfIdx, slot.pairId) {} catch (bytes memory reason) {
+            try this._createMarketExternal(slot.tfIdx, slot.pairId, slot.signedReport) {} catch (bytes memory reason) {
                 // F-06 part 2 (fail-forward): advance `pairTfLastCreated` so
                 // the next `checkUpkeep` doesn't re-flag this same failed
                 // slot. The failed slot becomes a permanent gap; the
@@ -370,9 +393,12 @@ contract UpDownAutoCycler is Ownable {
     }
 
     /// @dev Callable only via `this` from performUpkeep so failures are catchable.
-    function _createMarketExternal(uint256 tfIdx, bytes32 pairId) external {
+    ///      Streams-strike (2026-05-16): now also takes the signed Streams
+    ///      report for strike capture. Passed through to `_createMarket`
+    ///      which hands it to `resolver.captureStrike`.
+    function _createMarketExternal(uint256 tfIdx, bytes32 pairId, bytes memory signedReport) external {
         require(msg.sender == address(this), "only cycler");
-        _createMarket(tfIdx, pairId);
+        _createMarket(tfIdx, pairId, signedReport);
     }
 
     // ── Internal ────────────────────────────────────────────────────────
@@ -388,7 +414,7 @@ contract UpDownAutoCycler is Ownable {
     ///      from the backend's perspective). The off-chain matching engine
     ///      refuses to match orders on a market whose `startTime` is in
     ///      the future, so trades only land at-or-after the boundary.
-    function _createMarket(uint256 tfIdx, bytes32 pairId) internal {
+    function _createMarket(uint256 tfIdx, bytes32 pairId, bytes memory signedReport) internal {
         if (tfIdx >= NUM_TIMEFRAMES) revert InvalidTimeframeIndex();
         if (!supportedPairs[pairId]) revert("pair not supported");
 
@@ -406,37 +432,21 @@ contract UpDownAutoCycler is Ownable {
         }
         uint256 end = plannedStart + tf.duration;
 
-        // F-02: refuse to create a market whose `end` is already more than
-        // RESOLVER_MAX_STALENESS behind `nowTs`. The resolver's
-        // `MAX_STALENESS` (1h) bounds the latest moment a Chainlink round
-        // can be considered fresh for resolution. A slot whose `end` is
-        // already > 1h in the past can never be resolved cleanly — it
-        // would revert `ChainlinkResolver.StalePrice()` and accumulate
-        // in `_activeMarkets[]` forever (cf. POST_DEMO_TODO #21 evictUnresolved).
-        //
-        // The check fires BEFORE the strike fetch + external calls so a
-        // stale catch-up cycle exits cheaply. The cycler skips the slot
-        // here, and `performUpkeep`'s catch block advances
-        // `pairTfLastCreated` (F-06 fail-forward) so the next tick moves
-        // to the following slot instead of retrying the same stale one.
         if (end + RESOLVER_MAX_STALENESS < nowTs) {
-            // The literal check is on `end + MAX_STALENESS < nowTs` (end-of-slot
-            // staleness); the error is named `PlannedStartTooStale` for the
-            // semantic of "the planned start is past usefulness," which is the
-            // operator-facing interpretation. Don't rename — propagation churn.
             revert PlannedStartTooStale(plannedStart, end, nowTs);
         }
 
-        int256 strike = resolver.getPrice(pairId);
+        // Streams-strike (2026-05-16): replace the prior
+        // `resolver.getPrice(pairId)` (Data Feeds AggregatorV3 read, 1e8
+        // atomic scale) with `resolver.captureStrike(pairId, signedReport,
+        // plannedStart)` (Data Streams ReportV3 read, 1e18 atomic scale).
+        // Strike value flows through the same `int256` channel and the same
+        // settlement.createMarket signature — only the scale changes. The
+        // F-06 int128 range check below still applies; at 1e18 atomic
+        // representing ETH/BTC prices, the values fit comfortably in
+        // int128 (~9.2e36 max).
+        int256 strike = resolver.captureStrike(pairId, signedReport, uint64(plannedStart));
 
-        // F-06 part 1: int128 range check. The settlement casts `strike` to
-        // `int128` for storage (`UpDownSettlement._createMarket` line 262).
-        // Without this guard, a too-large strike would truncate silently in
-        // settlement, then fail `resolver.registerMarket`'s consistency check
-        // (`int256(sm.strikePrice) != strikePrice`) below, cascading into a
-        // catch block that — pre-F-06-part-2 — would stick the same slot
-        // forever. Range-check loudly here; the failure mode becomes a loud,
-        // single-call revert with the offending value preserved in the error.
         if (strike > type(int128).max || strike < type(int128).min) {
             revert StrikeOverflow(strike);
         }

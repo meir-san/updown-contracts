@@ -69,6 +69,21 @@ contract ChainlinkResolver is Ownable {
     ///         post-close price). The resolver refuses to resolve on a
     ///         report observed outside the bracket.
     error ReportObservationOutOfWindow(uint256 endTime, uint256 observationsTimestamp);
+    /// @notice Streams-strike (2026-05-16): report's `observationsTimestamp`
+    ///         is outside the symmetric ±MAX_STRIKE_REPORT_LAG window
+    ///         around the market's `startTime`. Either too old (observed
+    ///         before slot boundary by >tolerance) or too far in the
+    ///         future (observed after slot boundary by >tolerance). The
+    ///         strike anchor is the slot's clock-aligned boundary, so
+    ///         observations must be tight around it.
+    error ReportObservationOutOfStrikeWindow(uint64 startTime, uint256 observationsTimestamp);
+    /// @notice Streams-strike: (pairId, startTime) tuple has already had
+    ///         its strike captured. Replay protection — the cycler enforces
+    ///         per-slot uniqueness via `pairTfLastCreated`, this is
+    ///         defense-in-depth at the Resolver layer so a malformed
+    ///         performData (or future external caller) cannot reset the
+    ///         strike for an existing slot.
+    error StrikeAlreadyCaptured(bytes32 pairId, uint64 startTime);
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
@@ -80,6 +95,19 @@ contract ChainlinkResolver is Ownable {
     ///         monitoring and the `ChainlinkResolverService` config
     ///         reconciliation.
     event StreamsFeedConfigured(bytes32 indexed pairId, bytes32 feedId);
+    /// @notice Streams-strike (2026-05-16): emitted on `captureStrike` —
+    ///         records the per-slot strike value derived from a verified
+    ///         Streams report. Indexed by `(pairId, startTime)` so off-
+    ///         chain consumers can reconstruct the strike of any historic
+    ///         slot from chain logs alone. `observationsTimestamp` lets
+    ///         consumers audit the report-vs-slot-boundary lag (must be
+    ///         within MAX_STRIKE_REPORT_LAG per the validator below).
+    event StrikeCaptured(
+        bytes32 indexed pairId,
+        uint64 indexed startTime,
+        int256 strikePrice,
+        uint64 observationsTimestamp
+    );
     /// @notice Streams swap: emitted on `withdrawLink`. Owner clawback
     ///         + rotation audit trail.
     event LinkWithdrawn(address indexed to, uint256 amount);
@@ -114,6 +142,16 @@ contract ChainlinkResolver is Ownable {
     ///         observed AFTER `endTime` (that would price the market on
     ///         a post-close snapshot).
     uint256 public constant MAX_REPORT_OBSERVATION_LAG = 30 seconds;
+    /// @notice Streams-strike (2026-05-16): symmetric ±tolerance for
+    ///         `report.observationsTimestamp` vs the market's `startTime`.
+    ///         Mirrors `MAX_REPORT_OBSERVATION_LAG` (the settlement-side
+    ///         tolerance) numerically. Strike is captured AT slot boundary
+    ///         not AFTER, so the window is symmetric: observations can be
+    ///         either side of startTime by ±30s. This accommodates clock
+    ///         drift + DON publish cadence; tight enough to prevent
+    ///         meaningful price manipulation since Crypto streams update
+    ///         sub-second and a ±30s slice is essentially the same price.
+    uint256 public constant MAX_STRIKE_REPORT_LAG = 30 seconds;
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
     uint256 public constant OPTION_UP = 1;
     uint256 public constant OPTION_DOWN = 2;
@@ -147,6 +185,20 @@ contract ChainlinkResolver is Ownable {
     mapping(bytes32 => address) public priceFeeds;
     mapping(uint256 => MarketInfo) public markets;
     mapping(address => bool) public authorizedCallers;
+
+    /// @notice Streams-strike (2026-05-16): per-(pairId, startTime) record
+    ///         of strikes captured from verified Streams reports. The
+    ///         AutoCycler reads this in `_createMarket` to pass the strike
+    ///         to `settlement.createMarket`, replacing the prior
+    ///         `resolver.getPrice(pairId)` Data Feeds read. Indexed by
+    ///         `(pairId, startTime)` rather than `marketId` because the
+    ///         capture happens BEFORE `settlement.createMarket` mints the
+    ///         marketId — the cycler knows the slot boundary at scheduling
+    ///         time, the marketId only after creation. The cycler enforces
+    ///         per-slot uniqueness via `pairTfLastCreated`, but the
+    ///         `strikeCaptured` flag here is defense-in-depth.
+    mapping(bytes32 => mapping(uint64 => int256)) public capturedStrike;
+    mapping(bytes32 => mapping(uint64 => bool)) public strikeCaptured;
 
     // ── Constructor ─────────────────────────────────────────────────────
     /// @notice Constructor now takes the Streams Verifier Proxy + LINK
@@ -235,9 +287,81 @@ contract ChainlinkResolver is Ownable {
     // ── Public: price reading ───────────────────────────────────────────
     /// @notice Returns the latest validated price for a pair.
     ///         Reverts if the sequencer is down, in grace period, or price is stale.
+    ///
+    /// @dev Streams-strike (2026-05-16): this path is now LEGACY for strike
+    ///      capture. The AutoCycler reads strikes via `captureStrike` →
+    ///      `capturedStrike[pairId][startTime]` instead. `getPrice` is kept
+    ///      for any external read use, but `_createMarket` no longer calls
+    ///      it. The underlying `priceFeeds[pairId]` aggregator addresses are
+    ///      still configured (constructor + `configureFeed`) so historic
+    ///      markets resolve consistently against their captured strike.
     function getPrice(bytes32 pairId) external view returns (int256) {
         _checkSequencer();
         return _getLatestPrice(pairId);
+    }
+
+    // ── Public: Streams-strike capture ──────────────────────────────────
+    //
+    // Streams-strike (2026-05-16). Companion to `resolve()` — same Streams
+    // verification machinery, applied at slot-open time instead of slot-
+    // close. The motivation: pre-2026-05-16 the resolver consumed
+    // AggregatorV3 Data Feeds for strikes (1e8 atomic scale) and Streams
+    // for settlement (1e18 atomic scale). Mixed-scale on-chain data
+    // cascaded into the frontend's `+644782711328.57%` resolved-market
+    // delta bug + an unaudited assumption gap. Captured strikes via
+    // Streams unify the scale at 1e18 end-to-end.
+    //
+    // Caller responsibility:
+    //   - Fetch a signed `ReportV3` blob from the Streams REST API near
+    //     the slot's `startTime` (sub-second cadence; ±30s window).
+    //   - Pass the report + the slot's clock-aligned `startTime` here.
+    //   - LINK fee paid by this contract from its own balance (same
+    //     funding model as `resolve()`).
+    //
+    // Replay protection: `(pairId, startTime)` tuple may only be captured
+    // once. Cycler-side `pairTfLastCreated` already enforces slot
+    // uniqueness; this is defense-in-depth.
+    //
+    // Permissionless: any caller may submit a valid report for any pair
+    // at any startTime — the symmetric ±MAX_STRIKE_REPORT_LAG window and
+    // feedId binding bound what a malicious submitter could achieve to
+    // "capture the actual price near a real slot boundary," which is
+    // exactly the intended behavior.
+    function captureStrike(bytes32 pairId, bytes memory signedReport, uint64 startTime)
+        external
+        returns (int256 strikePrice)
+    {
+        if (strikeCaptured[pairId][startTime]) revert StrikeAlreadyCaptured(pairId, startTime);
+
+        _checkSequencer();
+
+        bytes32 wantFeedId = streamsFeedId[pairId];
+        if (wantFeedId == bytes32(0)) revert StreamsFeedNotConfigured();
+
+        bytes memory parameterPayload = _payVerificationFee(signedReport);
+        bytes memory verifierResponse = verifierProxy.verify(signedReport, parameterPayload);
+        ReportV3 memory report = abi.decode(verifierResponse, (ReportV3));
+
+        if (report.feedId != wantFeedId) revert ReportFeedIdMismatch(wantFeedId, report.feedId);
+        if (uint256(report.expiresAt) < block.timestamp) {
+            revert ReportExpired(uint256(report.expiresAt), block.timestamp);
+        }
+
+        // Strike window: symmetric ±MAX_STRIKE_REPORT_LAG around startTime.
+        // Differs from the settlement-side window which is asymmetric
+        // (`endTime - LAG <= obs <= endTime`) because strike is anchored AT
+        // slot boundary, settlement is anchored AT-OR-BEFORE close.
+        uint256 obs = uint256(report.observationsTimestamp);
+        uint256 startTs = uint256(startTime);
+        if (obs + MAX_STRIKE_REPORT_LAG < startTs || obs > startTs + MAX_STRIKE_REPORT_LAG) {
+            revert ReportObservationOutOfStrikeWindow(startTime, obs);
+        }
+
+        strikePrice = int256(report.price);
+        strikeCaptured[pairId][startTime] = true;
+        capturedStrike[pairId][startTime] = strikePrice;
+
+        emit StrikeCaptured(pairId, startTime, strikePrice, report.observationsTimestamp);
     }
 
     // ── Public: Data Streams report-bound resolution ─────────────────────
@@ -344,7 +468,7 @@ contract ChainlinkResolver is Ownable {
     /// @dev Pay the LINK verification fee, returning the `parameterPayload`
     ///      to pass to `verifierProxy.verify`. Encapsulates the FeeManager
     ///      lookup + approve dance so the main `resolve` flow stays linear.
-    function _payVerificationFee(bytes calldata signedReport)
+    function _payVerificationFee(bytes memory signedReport)
         internal
         returns (bytes memory parameterPayload)
     {
