@@ -239,11 +239,16 @@ contract UpDownAutoCyclerHarness is UpDownAutoCycler {
     }
 
     function harnessCreateMarket(uint256 tfIdx, bytes32 pairId) external {
-        // Streams-strike (2026-05-16): _createMarket now takes a signedReport.
-        // Empty bytes here — tests using this helper will hit captureStrike
-        // and fail there unless they pre-stage streamsFeedId + MockVerifierProxy.
-        // Migration pass tracked under task #42.
-        _createMarket(tfIdx, pairId, bytes(""));
+        // Streams-strike (2026-05-16): _createMarket forwards `signedReport`
+        // to `resolver.captureStrike → _payVerificationFee → abi.decode(_,
+        // (bytes32[3], bytes))`. Encode a valid empty-shape placeholder so
+        // the decode succeeds; the MockVerifierProxy returns whatever
+        // ReportV3 the test staged via `_stageStrikeReport`, independent
+        // of the report bytes content.
+        bytes32[3] memory header;
+        bytes memory inner = "";
+        bytes memory signedReport = abi.encode(header, inner);
+        _createMarket(tfIdx, pairId, signedReport);
     }
 
     function harnessCreateMarketWithReport(uint256 tfIdx, bytes32 pairId, bytes calldata signedReport) external {
@@ -308,17 +313,54 @@ contract UpDownUnit is Test {
 
     /// @dev Streams-strike helper: stage a canned ReportV3 on the
     ///      MockVerifierProxy such that `captureStrike(BTCUSD, _,
-    ///      slotStart)` will succeed and yield `price`. Caller is
-    ///      responsible for `vm.warp` to a clock-aligned slot boundary so
-    ///      that the cycler's computed plannedStart matches the report's
-    ///      observationsTimestamp within ±MAX_STRIKE_REPORT_LAG (30s).
-    function _stageStrikeReport(int192 price) internal {
+    ///      `obsTs`)` will succeed and yield `price`. `obsTs` should be
+    ///      the slot's plannedStart — the resolver enforces a symmetric
+    ///      ±MAX_STRIKE_REPORT_LAG (30s) window around that timestamp.
+    function _stageStrikeReport(int192 price, uint256 obsTs) internal {
         ReportV3 memory r;
         r.feedId = _btcStreamsFeedId();
-        r.observationsTimestamp = uint32(block.timestamp);
+        r.observationsTimestamp = uint32(obsTs);
         r.expiresAt = uint32(block.timestamp + 1 hours);
         r.price = price;
         verifierProxy.setNextReport(r);
+    }
+
+    /// @dev Convenience: stage with `obsTs = block.timestamp`. Suitable
+    ///      for resolve-flow tests where the report is observed at the
+    ///      same moment as the on-chain submission (which the captureStrike
+    ///      window covers for first-creates at boundary).
+    function _stageStrikeReport(int192 price) internal {
+        _stageStrikeReport(price, block.timestamp);
+    }
+
+    /// @dev Convenience: compute the plannedStart for the next
+    ///      `harnessCreateMarket(tfIdx, pairId)` call. Mirrors the
+    ///      formula in `_createMarket` so each test stages its report at
+    ///      the boundary the cycler will actually plan against.
+    function _nextPlannedStart(UpDownAutoCyclerHarness cycler, bytes32 pairId, uint256 tfIdx)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 tfDur = tfIdx == 0 ? 300 : (tfIdx == 1 ? 900 : 3600);
+        uint256 lastStart = cycler.pairTfLastCreated(pairId, tfIdx);
+        if (lastStart == 0) return (block.timestamp / tfDur) * tfDur;
+        return lastStart + tfDur;
+    }
+
+    /// @dev Combined helper: stage the report at the cycler's next
+    ///      plannedStart for `(pairId, tfIdx)`, then immediately
+    ///      `harnessCreateMarket`. Used to keep each test's
+    ///      Streams-strike plumbing to one line.
+    function _stageAndCreate(
+        UpDownAutoCyclerHarness cycler,
+        bytes32 pairId,
+        uint256 tfIdx,
+        int192 price
+    ) internal {
+        uint256 plannedStart = _nextPlannedStart(cycler, pairId, tfIdx);
+        _stageStrikeReport(price, plannedStart);
+        cycler.harnessCreateMarket(tfIdx, pairId);
     }
 
     function _btcStreamsFeedId() internal pure returns (bytes32) {
@@ -398,7 +440,7 @@ contract UpDownUnit is Test {
         vm.warp(ts);
         (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
 
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
 
         uint256 slotStart = (ts / 300) * 300;
         UpDownSettlement.Market memory m = settlement.getMarket(1);
@@ -415,8 +457,13 @@ contract UpDownUnit is Test {
         uint256 b15 = (ts / 900) * 900;
         assertEq(b5, b15, "fixture: 5m and 15m boundaries coincide");
 
-        cycler.harnessCreateMarket(0, BTCUSD);
-        cycler.harnessCreateMarket(1, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
+        // Shared boundary: 15m slot's plannedStart matches the 5m's. The
+        // resolver's captureStrike is idempotent on (pairId, startTime),
+        // so the second call returns the cached strike without verifying
+        // a fresh report. We still call _stageAndCreate for symmetry
+        // (and to validate the idempotent path under a fresh report).
+        _stageAndCreate(cycler, BTCUSD, 1, 50_000e18);
 
         UpDownSettlement.Market memory m5 = settlement.getMarket(1);
         UpDownSettlement.Market memory m15 = settlement.getMarket(2);
@@ -430,7 +477,7 @@ contract UpDownUnit is Test {
         vm.warp(ts);
         (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
 
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
 
         uint256 boundary = (ts / 300) * 300;
         assertEq(cycler.pairTfLastCreated(BTCUSD, 0), boundary);
@@ -472,13 +519,13 @@ contract UpDownUnit is Test {
         vm.warp(ts);
         (UpDownAutoCyclerHarness cycler, UpDownSettlement settlement) = _deployCyclerSystem();
 
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         UpDownSettlement.Market memory m1 = settlement.getMarket(1);
         uint256 firstStart = uint256(m1.startTime);
 
         // Advance into the next slot (300s later) and create again.
         vm.warp(firstStart + 350);
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         UpDownSettlement.Market memory m2 = settlement.getMarket(2);
 
         // Plain consecutive slot — start = previous start + duration.
@@ -497,14 +544,14 @@ contract UpDownUnit is Test {
         cycler.setPreStartWindowSec(30);
 
         // First market lands at the current boundary (bootstrap).
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         UpDownSettlement.Market memory m1 = settlement.getMarket(1);
         uint256 firstStart = uint256(m1.startTime);
         uint256 nextBoundary = firstStart + 300;
 
         // Warp to 25s before the next boundary — inside the pre-window.
         vm.warp(nextBoundary - 25);
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         UpDownSettlement.Market memory m2 = settlement.getMarket(2);
 
         // The new market's startTime is in the FUTURE relative to now.
@@ -522,7 +569,7 @@ contract UpDownUnit is Test {
         (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
 
         // Bootstrap one market so `pairTfLastCreated[BTCUSD][0] = boundary`.
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         uint256 boundary = (ts / 300) * 300;
         uint256 nextBoundary = boundary + 300;
 
@@ -551,7 +598,7 @@ contract UpDownUnit is Test {
     function test_F02_rejectsStaleCatchupSlot() public {
         // Bootstrap a 5m slot at `now`. lastCreated becomes the floor boundary.
         (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
 
         // Jump WAY forward — 24h later. Next slot's plannedStart =
         // lastStart + 300 = ~24h-ish in the past. end = plannedStart + 300
@@ -581,7 +628,7 @@ contract UpDownUnit is Test {
     ///         acceptable (strict `<` check, not `<=`).
     function test_F02_acceptsBoundaryFreshness() public {
         (UpDownAutoCyclerHarness cycler,) = _deployCyclerSystem();
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
 
         uint256 lastStart = cycler.pairTfLastCreated(BTCUSD, 0);
         uint256 end = lastStart + 600; // plannedStart=lastStart+300, end=plannedStart+300
@@ -590,7 +637,7 @@ contract UpDownUnit is Test {
         // `end + MAX_STALENESS < nowTs` so this case passes.
         vm.warp(end + cycler.RESOLVER_MAX_STALENESS());
 
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
 
         // Verify advancement and that no revert occurred.
         assertEq(cycler.pairTfLastCreated(BTCUSD, 0), lastStart + 300, "next slot was created at the boundary");
@@ -606,7 +653,7 @@ contract UpDownUnit is Test {
         // bootstrap snaps plannedStart to floor(nowTs / 300) * 300, so
         // end = plannedStart + 300 > nowTs trivially.
         vm.warp(block.timestamp + 365 days);
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
 
         uint256 ls = cycler.pairTfLastCreated(BTCUSD, 0);
         assertEq(ls, (block.timestamp / 300) * 300, "bootstrap aligned to current 5m boundary");
@@ -676,6 +723,13 @@ contract UpDownUnit is Test {
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(st));
         st.setAutocycler(address(cycler));
         r.setAuthorizedCaller(address(cycler), true);
+        // Streams-strike: configure the per-pair feedId + stage the
+        // oversized strike via the Mock VerifierProxy. The strike value
+        // now flows through captureStrike → ReportV3.price, not the
+        // legacy AggregatorV3 feed.
+        r.configureStreamsFeed(BTCUSD, _btcStreamsFeedId());
+        uint256 plannedStart = (block.timestamp / 300) * 300;
+        _stageStrikeReport(int192(oversized), plannedStart);
 
         vm.expectRevert(abi.encodeWithSelector(UpDownAutoCycler.StrikeOverflow.selector, oversized));
         cycler.harnessCreateMarket(0, BTCUSD);
@@ -695,6 +749,9 @@ contract UpDownUnit is Test {
         UpDownAutoCyclerHarness cycler = new UpDownAutoCyclerHarness(owner, address(r), address(st));
         st.setAutocycler(address(cycler));
         r.setAuthorizedCaller(address(cycler), true);
+        r.configureStreamsFeed(BTCUSD, _btcStreamsFeedId());
+        uint256 plannedStart = (block.timestamp / 300) * 300;
+        _stageStrikeReport(int192(boundary), plannedStart);
 
         cycler.harnessCreateMarket(0, BTCUSD);
         assertEq(cycler.activeMarketCount(), 1, "strike at exact boundary should succeed");
@@ -828,7 +885,7 @@ contract UpDownUnit is Test {
 
         // Create one 5m market at `now`; pairTfLastCreated[BTCUSD][0] is now
         // set to the current floor boundary.
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         assertEq(cycler.activeMarketCount(), 1, "pre-condition: one active market");
 
         // Disable 15m + 60m timeframes so no other create can be due.
@@ -861,7 +918,7 @@ contract UpDownUnit is Test {
         cycler.toggleTimeframe(2, false);
 
         // Bootstrap creates the first slot — its `pairTfLastCreated` is set.
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         uint256 lastStart = cycler.pairTfLastCreated(BTCUSD, 0);
 
         // Warp to slot end == next-create-eligible.
@@ -1063,7 +1120,7 @@ contract UpDownUnit is Test {
 
         // Force a state where checkUpkeep WOULD return true if not deprecated:
         // bootstrap a market, warp to next slot boundary so a create is due.
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         uint256 lastStart = cycler.pairTfLastCreated(BTCUSD, 0);
         vm.warp(lastStart + 300);
 
@@ -1110,7 +1167,7 @@ contract UpDownUnit is Test {
 
         // Now force a create-eligible state so upkeepNeeded gates true.
         // Bootstrap the 5m so lastCreated is set, then warp to next-create.
-        cycler.harnessCreateMarket(0, BTCUSD);
+        _stageAndCreate(cycler, BTCUSD, 0, 50_000e18);
         uint256 lastStart = cycler.pairTfLastCreated(BTCUSD, 0);
         vm.warp(lastStart + 300);
 

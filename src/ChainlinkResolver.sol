@@ -318,9 +318,16 @@ contract ChainlinkResolver is Ownable {
     //   - LINK fee paid by this contract from its own balance (same
     //     funding model as `resolve()`).
     //
-    // Replay protection: `(pairId, startTime)` tuple may only be captured
-    // once. Cycler-side `pairTfLastCreated` already enforces slot
-    // uniqueness; this is defense-in-depth.
+    // Idempotency: `(pairId, startTime)` tuple captures once on first
+    // call and returns the cached strike on subsequent calls without
+    // paying another verify fee. Required for shared-boundary creates —
+    // when a 5m/15m/60m boundary coincides (every 60m for 5m+15m+60m,
+    // every 15m for 5m+15m, etc.), the cycler emits one `CreateSlot` per
+    // timeframe with the SAME plannedStart, and each `_createMarket`
+    // calls captureStrike. A hard revert on "already captured" would
+    // permanently block the second + third creates at that boundary,
+    // leaving the longer-timeframe slots uncreated forever. The cached
+    // return is also cheaper than a fresh verify (~4k gas vs ~150k).
     //
     // Permissionless: any caller may submit a valid report for any pair
     // at any startTime — the symmetric ±MAX_STRIKE_REPORT_LAG window and
@@ -331,7 +338,9 @@ contract ChainlinkResolver is Ownable {
         external
         returns (int256 strikePrice)
     {
-        if (strikeCaptured[pairId][startTime]) revert StrikeAlreadyCaptured(pairId, startTime);
+        if (strikeCaptured[pairId][startTime]) {
+            return capturedStrike[pairId][startTime];
+        }
 
         _checkSequencer();
 
