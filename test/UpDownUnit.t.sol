@@ -239,7 +239,15 @@ contract UpDownAutoCyclerHarness is UpDownAutoCycler {
     }
 
     function harnessCreateMarket(uint256 tfIdx, bytes32 pairId) external {
-        _createMarket(tfIdx, pairId);
+        // Streams-strike (2026-05-16): _createMarket now takes a signedReport.
+        // Empty bytes here — tests using this helper will hit captureStrike
+        // and fail there unless they pre-stage streamsFeedId + MockVerifierProxy.
+        // Migration pass tracked under task #42.
+        _createMarket(tfIdx, pairId, bytes(""));
+    }
+
+    function harnessCreateMarketWithReport(uint256 tfIdx, bytes32 pairId, bytes calldata signedReport) external {
+        _createMarket(tfIdx, pairId, signedReport);
     }
 
     /// @dev F-06 fail-forward tests need to set pairTfLastCreated directly
@@ -287,6 +295,34 @@ contract UpDownUnit is Test {
         cycler = new UpDownAutoCyclerHarness(owner, address(r), address(settlement));
         settlement.setAutocycler(address(cycler));
         r.setAuthorizedCaller(address(cycler), true);
+
+        // Streams-strike (2026-05-16): pre-configure streamsFeedId for BTC
+        // so cycler-side `_createMarket → resolver.captureStrike` doesn't
+        // revert with StreamsFeedNotConfigured. Tests that need the strike
+        // capture to actually SUCCEED also need to stage a matching
+        // ReportV3 via `_stageStrikeReport` — without it, captureStrike
+        // reverts on ReportFeedIdMismatch (default ReportV3.feedId is 0).
+        vm.prank(owner);
+        r.configureStreamsFeed(BTCUSD, _btcStreamsFeedId());
+    }
+
+    /// @dev Streams-strike helper: stage a canned ReportV3 on the
+    ///      MockVerifierProxy such that `captureStrike(BTCUSD, _,
+    ///      slotStart)` will succeed and yield `price`. Caller is
+    ///      responsible for `vm.warp` to a clock-aligned slot boundary so
+    ///      that the cycler's computed plannedStart matches the report's
+    ///      observationsTimestamp within ±MAX_STRIKE_REPORT_LAG (30s).
+    function _stageStrikeReport(int192 price) internal {
+        ReportV3 memory r;
+        r.feedId = _btcStreamsFeedId();
+        r.observationsTimestamp = uint32(block.timestamp);
+        r.expiresAt = uint32(block.timestamp + 1 hours);
+        r.price = price;
+        verifierProxy.setNextReport(r);
+    }
+
+    function _btcStreamsFeedId() internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("BTC/USD-streams-test-feed-id"));
     }
 
 
@@ -338,9 +374,17 @@ contract UpDownUnit is Test {
         vm.warp(block.timestamp + 400 days);
         uint256[] memory resolveEmpty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory createAll = new UpDownAutoCycler.CreateSlot[](3);
-        createAll[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0});
-        createAll[1] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 1});
-        createAll[2] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 2});
+        // TODO(streams-strike-migration 2026-05-16): these CreateSlots
+        // exercise paths that hit `_createMarket` → `resolver.captureStrike`.
+        // For the new test to actually succeed past captureStrike, this
+        // test must (a) configure streamsFeedId[BTCUSD] on the resolver
+        // and (b) stage a ReportV3 on MockVerifierProxy matching plannedStart.
+        // Empty `signedReport` here will fail captureStrike with
+        // ReportFeedIdMismatch or similar — left for the follow-up test
+        // migration pass. Compile passes; runtime behavior changes.
+        createAll[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
+        createAll[1] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 1, plannedStart: 0, signedReport: bytes("")});
+        createAll[2] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 2, plannedStart: 0, signedReport: bytes("")});
 
         cycler.performUpkeep(abi.encode(resolveEmpty, createAll));
 
@@ -684,7 +728,7 @@ contract UpDownUnit is Test {
         // revert inside settlement.createMarket. F-06 catch fires.
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0});
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
         cycler.performUpkeep(abi.encode(empty, slots));
 
         // pairTfLastCreated must have advanced by exactly one tf.duration.
@@ -713,7 +757,7 @@ contract UpDownUnit is Test {
 
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0});
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
         cycler.performUpkeep(abi.encode(empty, slots));
 
         uint256 expectedBoundary = (block.timestamp / 300) * 300;
@@ -741,7 +785,7 @@ contract UpDownUnit is Test {
 
         uint256[] memory empty = new uint256[](0);
         UpDownAutoCycler.CreateSlot[] memory slots = new UpDownAutoCycler.CreateSlot[](1);
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0});
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 0, plannedStart: 0, signedReport: bytes("")});
 
         vm.expectEmit(true, true, false, true);
         emit UpDownAutoCycler.SlotSkippedAfterFailure(BTCUSD, 0, lastStart + 300);
@@ -761,7 +805,7 @@ contract UpDownUnit is Test {
         // with InvalidTimeframeIndex. Pre-F-06 the catch block would have
         // touched `timeframes[3]` and itself reverted. The defensive guard
         // prevents that.
-        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 3});
+        slots[0] = UpDownAutoCycler.CreateSlot({pairId: BTCUSD, tfIdx: 3, plannedStart: 0, signedReport: bytes("")});
 
         // Call must succeed (catch absorbs the inner revert, defensive guard
         // skips advancement). No double revert.
