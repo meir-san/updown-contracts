@@ -12,12 +12,30 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///
 ///   forge script script/Deploy.s.sol --rpc-url $ARBITRUM_RPC_URL --broadcast --verify
 ///
+/// 2026-05-16 Streams-strike migration: this script can either do a full
+/// fresh deploy (no env override) OR preserve an existing Settlement and
+/// redeploy only Resolver + AutoCycler against it. Migration mode is
+/// triggered by setting `EXISTING_SETTLEMENT_ADDRESS` env var. In that
+/// path, Settlement deploy is SKIPPED, and after Resolver + AutoCycler
+/// are deployed the script calls `settlement.setResolver(newResolver)` +
+/// `settlement.setAutocycler(newCycler)` from the deployer (owner) to
+/// rewire the existing Settlement's pointers. All historic markets +
+/// ThinWallet allowances against the existing Settlement stay intact.
+///
 /// Required env vars:
 ///   DEPLOYER_PRIVATE_KEY            — the deployer/owner key
 ///   ARBITRUM_RPC_URL                — Arbitrum One RPC
 ///   USDT_ADDRESS                    — USDT token on the target network
 ///   RELAYER_ADDRESS                 — relayer wallet that calls enterPosition / withdrawSettlement
 ///   TREASURY_ADDRESS                — treasury EOA that receives platformFee + funds rebate claims
+///
+/// Optional env var (migration mode):
+///   EXISTING_SETTLEMENT_ADDRESS     — when set, skip Settlement deploy and
+///                                     redeploy only Resolver + AutoCycler
+///                                     against this existing Settlement.
+///                                     Caller must be the existing
+///                                     Settlement's owner (deployer key
+///                                     matches).
 ///   CHAINLINK_VERIFIER_PROXY_ADDRESS — Data Streams VerifierProxy on the target network
 ///                                     (Arbitrum Sepolia testnet: 0x2ff010DEbC1297f19579B4246cad07bd24F2488A)
 ///   CHAINLINK_LINK_TOKEN_ADDRESS    — LINK token address on the target network
@@ -63,16 +81,41 @@ contract DeployUpDown is Script {
         address ethUsdFeed = vm.envAddress("CHAINLINK_ETH_USD_FEED");
         address sequencerFeed = vm.envAddress("CHAINLINK_SEQUENCER_FEED");
 
+        // Migration mode: EXISTING_SETTLEMENT_ADDRESS preserves historic
+        // markets + ThinWallet allowances. New deploy when unset.
+        address existingSettlement;
+        try vm.envAddress("EXISTING_SETTLEMENT_ADDRESS") returns (address a) {
+            existingSettlement = a;
+        } catch {
+            existingSettlement = address(0);
+        }
+
         console.log("Deployer:", deployer);
         console.log("USDT:", usdt);
         console.log("Relayer:", relayer);
         console.log("Treasury:", treasury);
+        if (existingSettlement != address(0)) {
+            console.log("Migration mode -- reusing Settlement:", existingSettlement);
+        } else {
+            console.log("Fresh deploy mode -- Settlement will be created");
+        }
 
         vm.startBroadcast(deployerKey);
 
-        UpDownSettlement settlement =
-            new UpDownSettlement(IERC20(usdt), deployer, PLATFORM_FEE_BPS, MAKER_FEE_BPS);
-        console.log("UpDownSettlement:", address(settlement));
+        UpDownSettlement settlement;
+        if (existingSettlement != address(0)) {
+            // Reuse the existing Settlement. Caller is responsible for
+            // ensuring `deployer` == existing settlement.owner() — if not,
+            // the setResolver/setAutocycler calls below will revert
+            // OnlyOwner from inside the broadcast. We don't pre-verify
+            // here because vm.broadcast eats the static call cleanly and
+            // any failure surfaces in the broadcast simulator.
+            settlement = UpDownSettlement(existingSettlement);
+            console.log("UpDownSettlement (existing):", address(settlement));
+        } else {
+            settlement = new UpDownSettlement(IERC20(usdt), deployer, PLATFORM_FEE_BPS, MAKER_FEE_BPS);
+            console.log("UpDownSettlement (fresh):", address(settlement));
+        }
 
         ChainlinkResolver resolver = new ChainlinkResolver(
             deployer,
@@ -94,18 +137,21 @@ contract DeployUpDown is Script {
         UpDownAutoCycler cycler = new UpDownAutoCycler(deployer, address(resolver), address(settlement));
         console.log("UpDownAutoCycler:", address(cycler));
 
+        // Rewire Settlement pointers. In migration mode, this overwrites
+        // the OLD resolver + autocycler refs that point at the orphaned
+        // pre-Streams-strike contracts. The relayer + treasury are
+        // unchanged across migrations but we set them idempotently to
+        // preserve a single source of truth in the deploy script.
         settlement.setResolver(address(resolver));
         settlement.setAutocycler(address(cycler));
         settlement.setRelayer(relayer);
-        // PR-5-bundle: wire treasury so atomic platformFee transfers land
-        // on the right EOA from the very first fill.
         settlement.setTreasury(treasury);
 
         resolver.setAuthorizedCaller(address(cycler), true);
 
-        // Whitelist + start cycling both pairs so AutoCycler creates markets
-        // for the repros immediately (the prior dev deployment did this in a
-        // separate one-off tx; folded in here).
+        // Whitelist + start cycling both pairs. In migration mode, the
+        // NEW cycler has a fresh _cyclingPairs[] state and needs the same
+        // whitelist as the orphaned old cycler.
         cycler.addPair(BTCUSD);
         cycler.addPair(ETHUSD);
 
